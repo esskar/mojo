@@ -1,89 +1,90 @@
 package Mojolicious::Plugin::HeaderCondition;
+use Mojo::Base 'Mojolicious::Plugin';
 
-use strict;
-use warnings;
-
-use base 'Mojolicious::Plugin';
-
-# You may have to "metaphorically" make a deal with the "devil".
-# And by "devil", I mean Robot Devil.
-# And by "metaphorically", I mean get your coat.
 sub register {
-    my ($self, $app) = @_;
+  my ($self, $app) = @_;
 
-    # Header
-    $app->routes->add_condition(
-        headers => sub {
-            my ($r, $c, $captures, $patterns) = @_;
+  # "headers" condition
+  $app->routes->add_condition(headers => \&_headers);
 
-            # Patterns
-            return unless $patterns && ref $patterns eq 'HASH';
+  # "agent" condition
+  $app->routes->add_condition(
+    agent => sub { _headers(@_[0 .. 2], {'User-Agent' => $_[3]}) });
 
-            # Match
-            my $passed;
-            while (my ($k, $v) = each(%$patterns)) {
-                my $header = $c->req->headers->header($k);
-                if ($header && $v && ref $v eq 'Regexp' && $header =~ $v) {
-                    $passed = 1;
-                    next;
-                }
-                elsif ($header && defined $v && $v eq $header) {
-                    $passed = 1;
-                    next;
-                }
-                $passed = undef;
-            }
+  # "host" condition
+  $app->routes->add_condition(
+    host => sub { _check($_[1]->req->url->to_abs->host, $_[3]) });
+}
 
-            # Success
-            return $captures if $passed;
+sub _check {
+  my ($value, $pattern) = @_;
+  return 1
+    if $value && $pattern && ref $pattern eq 'Regexp' && $value =~ $pattern;
+  return $value && defined $pattern && $pattern eq $value ? 1 : undef;
+}
 
-            # Robot 1-X, save my friends! And Zoidberg!
-            return;
-        }
-    );
+sub _headers {
+  my ($route, $c, $captures, $patterns) = @_;
+  return undef unless $patterns && ref $patterns eq 'HASH' && keys %$patterns;
+
+  # All headers need to match
+  my $headers = $c->req->headers;
+  while (my ($name, $pattern) = each %$patterns) {
+    return undef unless _check(scalar $headers->header($name), $pattern);
+  }
+  return 1;
 }
 
 1;
-__END__
 
 =head1 NAME
 
-Mojolicious::Plugin::HeaderCondition - Header Condition Plugin
+Mojolicious::Plugin::HeaderCondition - Header condition plugin
 
 =head1 SYNOPSIS
 
-    # Mojolicious
-    $self->plugin('header_condition');
+  # Mojolicious
+  $self->plugin('HeaderCondition');
+  $self->routes->get('/:controller/:action')
+    ->over(headers => {Referer => qr/example\.com/});
 
-    # Must match all of these headers
-    $self->routes->route('/:controller/:action')->over(headers => {
-        X-Secret-Header => 'Foo',
-        Referer => qr/^https?:\/\/example\.com\//
-    })->to('foo#bar');
+  # Mojolicious::Lite
+  plugin 'HeaderCondition';
+  get '/' => (headers => {Referer => qr/example\.com/}) => sub {...};
 
-    # Mojolicious::Lite
-    plugin 'header_condition';
-    get '/' => (headers => {'Referer' => qr/^https?:\/\/example\.com\//})
-      => sub {...};
+  # All headers need to match
+  $self->routes->get('/:controller/:action')->over(headers => {
+    'X-Secret-Header' => 'Foo',
+    Referer => qr/example\.com/
+  });
+
+  # The "agent" condition is a shortcut for the "User-Agent" header
+  get '/' => (agent => qr/Firefox/) => sub {...};
+
+  # The "host" condition is a shortcut for the detected host
+  get '/' => (host => qr/mojolicio\.us/) => sub {...};
 
 =head1 DESCRIPTION
 
-L<Mojolicous::Plugin::HeaderCondition> is a routes condition for header based
+L<Mojolicious::Plugin::HeaderCondition> is a route condition for header based
 routes.
+
+This is a core plugin, that means it is always enabled and its code a good
+example for learning to build new plugins, you're welcome to fork it.
 
 =head1 METHODS
 
 L<Mojolicious::Plugin::HeaderCondition> inherits all methods from
 L<Mojolicious::Plugin> and implements the following new ones.
 
-=head2 C<register>
+=head2 register
 
-    $plugin->register;
+  $plugin->register(Mojolicious->new);
 
 Register condition in L<Mojolicious> application.
 
 =head1 SEE ALSO
 
-L<Mojolicious>, L<Mojolicious::Guides>, L<http://mojolicious.org>.
+L<Mojolicious>, L<Mojolicious::Guides>, L<http://mojolicio.us>.
 
 =cut

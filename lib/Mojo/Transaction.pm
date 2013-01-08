@@ -1,323 +1,302 @@
 package Mojo::Transaction;
-
-use strict;
-use warnings;
-
-use base 'Mojo::Base';
+use Mojo::Base 'Mojo::EventEmitter';
 
 use Carp 'croak';
+use Mojo::Message::Request;
+use Mojo::Message::Response;
 
-__PACKAGE__->attr([qw/connection kept_alive local_address local_port/]);
-__PACKAGE__->attr([qw/previous remote_port/]);
-__PACKAGE__->attr(
-    [qw/finished resume_cb/] => sub {
-        sub {1}
-    }
-);
-__PACKAGE__->attr(keep_alive => 0);
+has [qw(kept_alive local_address local_port previous remote_port)];
+has req => sub { Mojo::Message::Request->new };
+has res => sub { Mojo::Message::Response->new };
 
-# Please don't eat me! I have a wife and kids. Eat them!
+sub client_close {
+  my $self = shift;
+  $self->res->finish;
+  return $self->server_close(@_);
+}
+
 sub client_read  { croak 'Method "client_read" not implemented by subclass' }
 sub client_write { croak 'Method "client_write" not implemented by subclass' }
 
+sub connection {
+  my $self = shift;
+  return $self->emit(connection => $self->{connection} = shift) if @_;
+  return $self->{connection};
+}
+
 sub error {
-    my $self = shift;
-    my $req  = $self->req;
-    return $req->error if $req->error;
-    my $res = $self->res;
-    return $res->error if $res->error;
-    return;
+  my $self = shift;
+  my $req  = $self->req;
+  return $req->error if $req->error;
+  my $res = $self->res;
+  return $res->error ? $res->error : undef;
 }
 
-sub is_done {
-    return 1 if (shift->{_state} || '') eq 'done';
-    return;
-}
+sub is_finished { (shift->{state} // '') eq 'finished' }
 
-sub is_websocket {0}
+sub is_websocket {undef}
 
 sub is_writing {
-    return 1 unless my $state = shift->{_state};
-    return 1
-      if $state eq 'write'
-          || $state eq 'write_start_line'
-          || $state eq 'write_headers'
-          || $state eq 'write_body';
-    return;
+  return 1 unless my $state = shift->{state};
+  return !!grep { $_ eq $state }
+    qw(write write_start_line write_headers write_body);
 }
 
 sub remote_address {
-    my ($self, $address) = @_;
+  my $self = shift;
 
-    # Set
-    if ($address) {
-        $self->{remote_address} = $address;
+  # New address
+  if (@_) {
+    $self->{remote_address} = shift;
+    return $self;
+  }
 
-        # Activate reverse proxy support for local requests
-        $ENV{MOJO_REVERSE_PROXY} ||= 1 if $address eq '127.0.0.1';
+  # Reverse proxy
+  if ($ENV{MOJO_REVERSE_PROXY}) {
+    return $self->{forwarded_for} if $self->{forwarded_for};
+    my $forwarded = $self->req->headers->header('X-Forwarded-For') || '';
+    $forwarded =~ /([^,\s]+)$/ and return $self->{forwarded_for} = $1;
+  }
 
-        return $self;
-    }
-
-    # Reverse proxy
-    if ($ENV{MOJO_REVERSE_PROXY}) {
-
-        # Forwarded
-        my $forwarded = $self->{_forwarded_for};
-        return $forwarded if $forwarded;
-
-        # Reverse proxy
-        if ($forwarded = $self->req->headers->header('X-Forwarded-For')) {
-
-            # Real address
-            if ($forwarded =~ /([^,\s]+)$/) {
-                $self->{_forwarded_for} = $1;
-                return $1;
-            }
-        }
-    }
-
-    # Get
-    return $self->{remote_address};
+  return $self->{remote_address};
 }
 
-sub req { croak 'Method "req" not implemented by subclass' }
-sub res { croak 'Method "res" not implemented by subclass' }
-
 sub resume {
-    my $self = shift;
-
-    # Delayed
-    if (($self->{_state} || '') eq 'paused') {
-        $self->{_state} = 'write_body';
-    }
-
-    # Writing
-    elsif (!$self->is_writing) { $self->{_state} = 'write' }
-
-    # Callback
-    $self->resume_cb->($self);
-
-    return $self;
+  my $self = shift;
+  if (($self->{state} // '') eq 'paused') { $self->{state} = 'write_body' }
+  elsif (!$self->is_writing) { $self->{state} = 'write' }
+  return $self->emit('resume');
 }
 
 sub server_close {
-    my $self = shift;
-
-    # Transaction finished
-    $self->finished->($self);
-
-    return $self;
+  my $self = shift;
+  $self->{state} = 'finished';
+  return $self->emit('finish');
 }
 
 sub server_read  { croak 'Method "server_read" not implemented by subclass' }
 sub server_write { croak 'Method "server_write" not implemented by subclass' }
 
-sub success {
-    my $self = shift;
-    return $self->res unless $self->error;
-    return;
-}
+sub success { $_[0]->error ? undef : $_[0]->res }
 
 1;
-__END__
 
 =head1 NAME
 
-Mojo::Transaction - Transaction Base Class
+Mojo::Transaction - Transaction base class
 
 =head1 SYNOPSIS
 
-    use base 'Mojo::Transaction';
+  package Mojo::Transaction::MyTransaction;
+  use Mojo::Base 'Mojo::Transaction';
+
+  sub client_read  {...}
+  sub client_write {...}
+  sub server_read  {...}
+  sub server_write {...}
 
 =head1 DESCRIPTION
 
 L<Mojo::Transaction> is an abstract base class for transactions.
 
+=head1 EVENTS
+
+L<Mojo::Transaction> inherits all events from L<Mojo::EventEmitter> and can
+emit the following new ones.
+
+=head2 connection
+
+  $tx->on(connection => sub {
+    my ($tx, $connection) = @_;
+    ...
+  });
+
+Emitted when a connection has been assigned to transaction.
+
+=head2 finish
+
+  $tx->on(finish => sub {
+    my $tx = shift;
+    ...
+  });
+
+Emitted when transaction is finished.
+
+=head2 resume
+
+  $tx->on(resume => sub {
+    my $tx = shift;
+    ...
+  });
+
+Emitted when transaction is resumed.
+
 =head1 ATTRIBUTES
 
 L<Mojo::Transaction> implements the following attributes.
 
-=head2 C<connection>
+=head2 kept_alive
 
-    my $connection = $tx->connection;
-    $tx            = $tx->connection($connection);
-
-Connection identifier or socket.
-
-=head2 C<finished>
-
-    my $cb = $tx->finished;
-    $tx    = $tx->finished(sub {...});
-
-Callback signaling that the transaction has been finished.
-
-    $tx->finsihed(sub {
-        my $self = shift;
-    });
-
-=head2 C<keep_alive>
-
-    my $keep_alive = $tx->keep_alive;
-    $tx            = $tx->keep_alive(1);
-
-Connection can be kept alive.
-
-=head2 C<kept_alive>
-
-    my $kept_alive = $tx->kept_alive;
-    $tx            = $tx->kept_alive(1);
+  my $kept_alive = $tx->kept_alive;
+  $tx            = $tx->kept_alive(1);
 
 Connection has been kept alive.
 
-=head2 C<local_address>
+=head2 local_address
 
-    my $local_address = $tx->local_address;
-    $tx               = $tx->local_address($address);
+  my $address = $tx->local_address;
+  $tx         = $tx->local_address('127.0.0.1');
 
 Local interface address.
 
-=head2 C<local_port>
+=head2 local_port
 
-    my $local_port = $tx->local_port;
-    $tx            = $tx->local_port($port);
+  my $port = $tx->local_port;
+  $tx      = $tx->local_port(8080);
 
 Local interface port.
 
-=head2 C<previous>
+=head2 previous
 
-    my $previous = $tx->previous;
-    $tx          = $tx->previous(Mojo::Transaction->new);
+  my $previous = $tx->previous;
+  $tx          = $tx->previous(Mojo::Transaction->new);
 
 Previous transaction that triggered this followup transaction.
 
-=head2 C<remote_address>
+  # Path of previous request
+  say $tx->previous->req->url->path;
 
-    my $remote_address = $tx->remote_address;
-    $tx                = $tx->remote_address($address);
+=head2 remote_port
 
-Remote interface address.
-
-=head2 C<remote_port>
-
-    my $remote_port = $tx->remote_port;
-    $tx             = $tx->remote_port($port);
+  my $port = $tx->remote_port;
+  $tx      = $tx->remote_port(8081);
 
 Remote interface port.
 
-=head2 C<resume_cb>
+=head2 req
 
-    my $cb = $tx->resume_cb;
-    $tx    = $tx->resume_cb(sub {...});
+  my $req = $tx->req;
+  $tx     = $tx->req(Mojo::Message::Request->new);
 
-Callback to be invoked whenever the transaction is resumed.
+HTTP request, defaults to a L<Mojo::Message::Request> object.
+
+=head2 res
+
+  my $res = $tx->res;
+  $tx     = $tx->res(Mojo::Message::Response->new);
+
+HTTP response, defaults to a L<Mojo::Message::Response> object.
 
 =head1 METHODS
 
-L<Mojo::Transaction> inherits all methods from L<Mojo::Base> and implements
-the following new ones.
+L<Mojo::Transaction> inherits all methods from L<Mojo::EventEmitter> and
+implements the following new ones.
 
-=head2 C<client_read>
+=head2 client_close
 
-    $tx = $tx->client_read($chunk);
+  $tx->client_close;
 
-Read and process client data.
+Transaction closed client-side, used to implement user agents.
 
-=head2 C<client_write>
+=head2 client_read
 
-    my $chunk = $tx->client_write;
+  $tx->client_read($chunk);
 
-Write client data.
+Read data client-side, used to implement user agents. Meant to be overloaded
+in a subclass.
 
-=head2 C<error>
+=head2 client_write
 
-    my $message          = $message->error;
-    my ($message, $code) = $message->error;
+  my $chunk = $tx->client_write;
 
-Parser errors and codes.
+Write data client-side, used to implement user agents. Meant to be overloaded
+in a subclass.
 
-=head2 C<is_done>
+=head2 connection
 
-    my $done = $tx->is_done;
+  my $connection = $tx->connection;
+  $tx            = $tx->connection($connection);
 
-Check if transaction is done.
+Connection identifier or socket.
 
-=head2 C<is_websocket>
+=head2 error
 
-    my $is_websocket = $tx->is_websocket;
+  my $err          = $tx->error;
+  my ($err, $code) = $tx->error;
 
-Check if transaction is a WebSocket.
+Error and code.
 
-=head2 C<is_writing>
+=head2 is_finished
 
-    my $writing = $tx->is_writing;
+  my $success = $tx->is_finished;
+
+Check if transaction is finished.
+
+=head2 is_websocket
+
+  my $false = $tx->is_websocket;
+
+False.
+
+=head2 is_writing
+
+  my $success = $tx->is_writing;
 
 Check if transaction is writing.
 
-=head2 C<req>
+=head2 resume
 
-    my $req = $tx->req;
-
-Transaction request, usually a L<Mojo::Message::Request> object.
-
-=head2 C<res>
-
-    my $res = $tx->res;
-
-Transaction response, usually a L<Mojo::Message::Response> object.
-
-=head2 C<resume>
-
-    $tx = $tx->resume;
+  $tx = $tx->resume;
 
 Resume transaction.
 
-=head2 C<server_close>
+=head2 remote_address
 
-    $tx = $tx->server_close;
+  my $address = $tx->remote_address;
+  $tx         = $tx->remote_address('127.0.0.1');
 
-Transaction closed.
+Remote interface address.
 
-=head2 C<server_read>
+=head2 server_close
 
-    $tx = $tx->server_read($chunk);
+  $tx->server_close;
 
-Read and process server data.
+Transaction closed server-side, used to implement web servers.
 
-=head2 C<server_write>
+=head2 server_read
 
-    my $chunk = $tx->server_write;
+  $tx->server_read($chunk);
 
-Write server data.
+Read data server-side, used to implement web servers. Meant to be overloaded
+in a subclass.
 
-=head2 C<success>
+=head2 server_write
 
-    my $res = $tx->success;
+  my $chunk = $tx->server_write;
+
+Write data server-side, used to implement web servers. Meant to be overloaded
+in a subclass.
+
+=head2 success
+
+  my $res = $tx->success;
 
 Returns the L<Mojo::Message::Response> object (C<res>) if transaction was
-successful or C<undef> otherwise.
-Connection and parser errors have only a message in C<error>, 400 and 500
-responses also a code.
-Note that this method is EXPERIMENTAL and might change without warning!
+successful or C<undef> otherwise. Connection and parser errors have only a
+message in C<error>, 400 and 500 responses also a code.
 
-    if (my $res = $tx->success) {
-        print $res->body;
-    }
-    else {
-        my ($message, $code) = $tx->error;
-        if ($code) {
-            print "$code $message response.\n";
-        }
-        else {
-            print "Connection error: $message\n";
-        }
-    }
+  # Sensible exception handling
+  if (my $res = $tx->success) { say $res->body }
+  else {
+    my ($err, $code) = $tx->error;
+    say $code ? "$code response: $err" : "Connection error: $err";
+  }
 
 Error messages can be accessed with the C<error> method of the transaction
 object.
 
 =head1 SEE ALSO
 
-L<Mojolicious>, L<Mojolicious::Guides>, L<http://mojolicious.org>.
+L<Mojolicious>, L<Mojolicious::Guides>, L<http://mojolicio.us>.
 
 =cut

@@ -1,45 +1,44 @@
 package Mojo::Log;
-
-use strict;
-use warnings;
-
-use base 'Mojo::Base';
+use Mojo::Base 'Mojo::EventEmitter';
 
 use Carp 'croak';
 use Fcntl ':flock';
-use IO::File;
 
-__PACKAGE__->attr(
-    handle => sub {
-        my $self = shift;
+has handle => sub {
 
-        # Need a log file
-        unless ($self->path) {
-            binmode STDERR, ':utf8';
-            return \*STDERR;
-        }
+  # File
+  if (my $path = shift->path) {
+    croak qq{Can't open log file "$path": $!}
+      unless open my $file, '>>:utf8', $path;
+    return $file;
+  }
 
-        # Open
-        my $file = IO::File->new;
-        my $path = $self->path;
-        $file->open(">> $path") or croak qq/Can't open log file "$path": $!/;
+  # STDERR
+  binmode STDERR, ':utf8';
+  return \*STDERR;
+};
+has level => 'debug';
+has 'path';
 
-        # utf8
-        binmode $file, ':utf8';
-
-        return $file;
-    }
-);
-__PACKAGE__->attr(level => 'debug');
-__PACKAGE__->attr('path');
-
+# Supported log level
 my $LEVEL = {debug => 1, info => 2, warn => 3, error => 4, fatal => 5};
 
-# Yes, I got the most! I win X-Mas!
-sub debug { shift->log('debug', @_) }
-sub error { shift->log('error', @_) }
-sub fatal { shift->log('fatal', @_) }
-sub info  { shift->log('info',  @_) }
+sub new {
+  my $self = shift->SUPER::new(@_);
+  $self->on(message => \&_message);
+  return $self;
+}
+
+sub debug { shift->log(debug => @_) }
+sub error { shift->log(error => @_) }
+sub fatal { shift->log(fatal => @_) }
+
+sub format {
+  my ($self, $level, @lines) = @_;
+  return '[' . localtime(time) . "] [$level] " . join("\n", @lines) . "\n";
+}
+
+sub info { shift->log(info => @_) }
 
 sub is_debug { shift->is_level('debug') }
 sub is_error { shift->is_level('error') }
@@ -47,182 +46,212 @@ sub is_fatal { shift->is_level('fatal') }
 sub is_info  { shift->is_level('info') }
 
 sub is_level {
-    my ($self, $level) = @_;
-
-    # Shortcut
-    return unless $level;
-
-    # Check
-    $level = lc $level;
-    my $current = $ENV{MOJO_LOG_LEVEL} || $self->level;
-    return $LEVEL->{$level} >= $LEVEL->{$current};
+  my ($self, $level) = @_;
+  return $LEVEL->{lc $level} >= $LEVEL->{$ENV{MOJO_LOG_LEVEL} || $self->level};
 }
 
 sub is_warn { shift->is_level('warn') }
 
-sub log {
-    my ($self, $level, @msgs) = @_;
+sub log { shift->emit('message', lc(shift), @_) }
 
-    # Check log level
-    $level = lc $level;
-    return $self unless $level && $self->is_level($level);
+sub warn { shift->log(warn => @_) }
 
-    my $time = localtime(time);
-    my $msgs = join "\n", @msgs;
+sub _message {
+  my ($self, $level, @lines) = @_;
 
-    # Caller
-    my ($pkg, $line) = (caller())[0, 2];
-    ($pkg, $line) = (caller(1))[0, 2] if $pkg eq ref $self;
+  # Check level
+  return unless $self->is_level($level) && (my $handle = $self->handle);
 
-    # Lock
-    my $handle = $self->handle;
-    flock $handle, LOCK_EX;
-
-    # Write
-    $handle->syswrite("$time $level $pkg:$line [$$]: $msgs\n");
-
-    # Unlock
-    flock $handle, LOCK_UN;
-
-    return $self;
+  # Format lines and write to handle
+  flock $handle, LOCK_EX;
+  croak "Can't write to log: $!"
+    unless defined $handle->syswrite($self->format($level, @lines));
+  flock $handle, LOCK_UN;
 }
 
-sub warn { shift->log('warn', @_) }
-
 1;
-__END__
 
 =head1 NAME
 
-Mojo::Log - Simple Logger For Mojo
+Mojo::Log - Simple logger
 
 =head1 SYNOPSIS
 
-    use Mojo::Log;
+  use Mojo::Log;
 
-    # Create a logging object that will log to STDERR by default
-    my $log = Mojo::Log->new;
+  # Log to STDERR
+  my $log = Mojo::Log->new;
 
-    # Customize the log location and minimum log level
-    my $log = Mojo::Log->new(
-        path  => '/var/log/mojo.log',
-        level => 'warn',
-    );
+  # Customize log file location and minimum log level
+  my $log = Mojo::Log->new(path => '/var/log/mojo.log', level => 'warn');
 
-    $log->debug("Why isn't this working?");
-    $log->info("FYI: it happened again");
-    $log->warn("This might be a problem");
-    $log->error("Garden variety error");
-    $log->fatal("Boom!");
+  # Log messages
+  $log->debug('Why is this not working?');
+  $log->info('FYI: it happened again.');
+  $log->warn('This might be a problem.');
+  $log->error('Garden variety error.');
+  $log->fatal('Boom!');
 
 =head1 DESCRIPTION
 
 L<Mojo::Log> is a simple logger for L<Mojo> projects.
 
+=head1 EVENTS
+
+L<Mojo::Log> inherits all events from L<Mojo::EventEmitter> and can emit the
+following new ones.
+
+=head2 message
+
+  $log->on(message => sub {
+    my ($log, $level, @lines) = @_;
+    ...
+  });
+
+Emitted when a new message gets logged.
+
+  $log->unsubscribe('message');
+  $log->on(message => sub {
+    my ($log, $level, @lines) = @_;
+    say "$level: ", @lines;
+  });
+
 =head1 ATTRIBUTES
 
 L<Mojo::Log> implements the following attributes.
 
-=head2 C<handle>
+=head2 handle
 
-    my $handle = $log->handle;
-    $log       = $log->handle(IO::File->new);
+  my $handle = $log->handle;
+  $log       = $log->handle(IO::Handle->new);
 
-Logfile handle.
+Log file handle used by default C<message> event, defaults to opening C<path>
+or C<STDERR>.
 
-=head2 C<level>
+=head2 level
 
-    my $level = $log->level;
-    $log      = $log->level('debug');
+  my $level = $log->level;
+  $log      = $log->level('debug');
 
-Log level.
+Active log level, defaults to the value of the C<MOJO_LOG_LEVEL> environment
+variable or C<debug>.
 
-=head2 C<path>
+These levels are currently available:
 
-    my $path = $log->path
-    $log     = $log->path('/var/log/mojo.log');
+=over 2
 
-Logfile path.
+=item debug
+
+=item info
+
+=item warn
+
+=item error
+
+=item fatal
+
+=back
+
+=head2 path
+
+  my $path = $log->path
+  $log     = $log->path('/var/log/mojo.log');
+
+Log file path used by C<handle>.
 
 =head1 METHODS
 
-L<Mojo::Log> inherits all methods from L<Mojo::Base> and implements the
-following new ones.
+L<Mojo::Log> inherits all methods from L<Mojo::EventEmitter> and implements
+the following new ones.
 
-=head2 C<debug>
+=head2 new
 
-    $log = $log->debug('You screwed up, but thats ok');
+  my $log = Mojo::Log->new;
+
+Construct a new L<Mojo::Log> object and subscribe to C<message> event with
+default logger.
+
+=head2 debug
+
+  $log = $log->debug('You screwed up, but that is ok');
 
 Log debug message.
 
-=head2 C<error>
+=head2 error
 
-    $log = $log->error('You really screwed up this time');
+  $log = $log->error('You really screwed up this time');
 
 Log error message.
 
-=head2 C<fatal>
+=head2 fatal
 
-    $log = $log->fatal('Its over...');
+  $log = $log->fatal('Its over...');
 
 Log fatal message.
 
-=head2 C<info>
+=head2 format
 
-    $log = $log->info('You are bad, but you prolly know already');
+  my $msg = $log->format('debug', 'Hi there!');
+  my $msg = $log->format('debug', 'Hi', 'there!');
+
+Format log message.
+
+=head2 info
+
+  $log = $log->info('You are bad, but you prolly know already');
 
 Log info message.
 
-=head2 C<is_level>
+=head2 is_level
 
-    my $is = $log->is_level('debug');
+  my $success = $log->is_level('debug');
 
 Check log level.
 
-=head2 C<is_debug>
+=head2 is_debug
 
-    my $is = $log->is_debug;
+  my $success = $log->is_debug;
 
 Check for debug log level.
 
-=head2 C<is_error>
+=head2 is_error
 
-    my $is = $log->is_error;
+  my $success = $log->is_error;
 
 Check for error log level.
 
-=head2 C<is_fatal>
+=head2 is_fatal
 
-    my $is = $log->is_fatal;
+  my $success = $log->is_fatal;
 
 Check for fatal log level.
 
-=head2 C<is_info>
+=head2 is_info
 
-    my $is = $log->is_info;
+  my $success = $log->is_info;
 
 Check for info log level.
 
-=head2 C<is_warn>
+=head2 is_warn
 
-    my $is = $log->is_warn;
+  my $success = $log->is_warn;
 
 Check for warn log level.
 
-=head2 C<log>
+=head2 log
 
-    $log = $log->log(debug => 'This should work');
+  $log = $log->log(debug => 'This should work');
 
-Log a message.
+Emit C<message> event.
 
-=head2 C<warn>
+=head2 warn
 
-    $log = $log->warn('Dont do that Dave...');
+  $log = $log->warn('Dont do that Dave...');
 
 Log warn message.
 
 =head1 SEE ALSO
 
-L<Mojolicious>, L<Mojolicious::Guides>, L<http://mojolicious.org>.
+L<Mojolicious>, L<Mojolicious::Guides>, L<http://mojolicio.us>.
 
 =cut

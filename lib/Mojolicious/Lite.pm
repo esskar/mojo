@@ -1,719 +1,1037 @@
 package Mojolicious::Lite;
+use Mojo::Base 'Mojolicious';
 
-use strict;
-use warnings;
+# "Bender: Bite my shiny metal ass!"
+use File::Basename qw(basename dirname);
+use File::Spec::Functions 'catdir';
+use Mojo::UserAgent;
+use Mojo::Util 'monkey_patch';
 
-use base 'Mojolicious';
-
-use File::Spec;
-use FindBin;
-
-# Make reloading work
-BEGIN { $INC{$0} = $0 }
-
-# It's the future, my parents, my co-workers, my girlfriend,
-# I'll never see any of them ever again... YAHOOO!
 sub import {
-    my $class = shift;
 
-    # Lite apps are strict!
-    strict->import;
-    warnings->import;
+  # Executable
+  $ENV{MOJO_EXE} ||= (caller)[1];
 
-    # Home
-    $ENV{MOJO_HOME} ||= File::Spec->catdir(split '/', $FindBin::Bin);
+  # Home
+  local $ENV{MOJO_HOME} = catdir(split '/', dirname $ENV{MOJO_EXE})
+    unless $ENV{MOJO_HOME};
 
-    # Initialize app
-    my $app = $class->new;
+  # Initialize app
+  my $caller = caller;
+  no strict 'refs';
+  push @{"${caller}::ISA"}, 'Mojo';
+  my $app = shift->new;
 
-    # Initialize routes
-    my $routes = $app->routes;
-    $routes->namespace('');
+  # Moniker
+  my $moniker = basename $ENV{MOJO_EXE};
+  $moniker =~ s/\.(?:pl|pm|t)$//i;
+  $app->moniker($moniker);
 
-    # Route generator
-    my $route = sub {
-        my ($methods, @args) = @_;
+  # Initialize routes
+  my $routes = $app->routes->namespaces([]);
 
-        my ($cb, $constraints, $defaults, $name, $pattern);
-        my $conditions = [];
+  # Default static and template class
+  $app->static->classes->[0] = $app->renderer->classes->[0] = $caller;
 
-        # Route information
-        my $condition;
-        while (my $arg = shift @args) {
+  # Functions
+  my $root = $routes;
+  for my $name (qw(any get options patch post put websocket)) {
+    monkey_patch $caller, $name, sub { $routes->$name(@_) };
+  }
+  monkey_patch $caller, $_, sub {$app}
+    for qw(new app);
+  monkey_patch $caller, del => sub { $routes->delete(@_) };
+  monkey_patch $caller, group => sub (&) {
+    my $old = $root;
+    $_[0]->($root = $routes);
+    ($routes, $root) = ($root, $old);
+  };
+  monkey_patch $caller,
+    helper => sub { $app->helper(@_) },
+    hook   => sub { $app->hook(@_) },
+    plugin => sub { $app->plugin(@_) },
+    under  => sub { $routes = $root->under(@_) };
 
-            # Condition can be everything
-            if ($condition) {
-                push @$conditions, $condition => $arg;
-                $condition = undef;
-            }
+  # Make sure there's a default application for testing
+  Mojo::UserAgent->app($app) unless Mojo::UserAgent->app;
 
-            # First scalar is the pattern
-            elsif (!ref $arg && !$pattern) { $pattern = $arg }
-
-            # Scalar
-            elsif (!ref $arg && @args) { $condition = $arg }
-
-            # Last scalar is the route name
-            elsif (!ref $arg) { $name = $arg }
-
-            # Callback
-            elsif (ref $arg eq 'CODE') { $cb = $arg }
-
-            # Constraints
-            elsif (ref $arg eq 'ARRAY') { $constraints = $arg }
-
-            # Defaults
-            elsif (ref $arg eq 'HASH') { $defaults = $arg }
-        }
-
-        # Defaults
-        $constraints ||= [];
-
-        # Defaults
-        $defaults ||= {};
-        $defaults->{cb} = $cb if $cb;
-
-        # Name
-        $name ||= '';
-
-        # Create bridge
-        return $routes =
-          $app->routes->bridge($pattern, {@$constraints})->over($conditions)
-          ->to($defaults)->name($name)
-          if !ref $methods && $methods eq 'under';
-
-        # WebSocket
-        my $websocket = 1 if !ref $methods && $methods eq 'websocket';
-        $methods = [] if $websocket;
-
-        # Create route
-        my $route =
-          $routes->route($pattern, {@$constraints})->over($conditions)
-          ->via($methods)->to($defaults)->name($name);
-
-        # WebSocket
-        $route->websocket if $websocket;
-
-        return $route;
-    };
-
-    # Prepare exports
-    my $caller = caller;
-    no strict 'refs';
-    no warnings 'redefine';
-
-    # Default static and template class
-    $app->static->default_static_class($caller);
-    $app->renderer->default_template_class($caller);
-
-    # Export
-    *{"${caller}::new"} = *{"${caller}::app"} = sub {$app};
-    *{"${caller}::any"} = sub { $route->(ref $_[0] ? shift : [], @_) };
-    *{"${caller}::get"} = sub { $route->('get', @_) };
-    *{"${caller}::under"} = *{"${caller}::ladder"} =
-      sub { $route->('under', @_) };
-    *{"${caller}::plugin"}        = sub { $app->plugin(@_) };
-	*{"${caller}::plugin_direct"} = sub { $app->plugin_direct(@_) };
-    *{"${caller}::post"}          = sub { $route->('post', @_) };
-    *{"${caller}::websocket"}     = sub { $route->('websocket', @_) };
-
-    # We are most likely the app in a lite environment
-    $ENV{MOJO_APP} = $app;
-
-    # Shagadelic!
-    *{"${caller}::shagadelic"} = sub { Mojolicious::Lite->start(@_) };
+  # Lite apps are strict!
+  Mojo::Base->import(-strict);
 }
 
 1;
-__END__
 
 =head1 NAME
 
-Mojolicious::Lite - Micro Web Framework
+Mojolicious::Lite - Real-time micro web framework
 
 =head1 SYNOPSIS
 
-    # Using Mojolicious::Lite will enable "strict" and "warnings"
-    use Mojolicious::Lite;
+  # Automatically enables "strict", "warnings", "utf8" and Perl 5.10 features
+  use Mojolicious::Lite;
 
-    # Route with placeholder
-    get '/:foo' => sub {
-        my $self = shift;
-        my $foo  = $self->param('foo');
-        $self->render(text => "Hello from $foo!");
-    };
+  # Route with placeholder
+  get '/:foo' => sub {
+    my $self = shift;
+    my $foo  = $self->param('foo');
+    $self->render(text => "Hello from $foo.");
+  };
 
-    # Start the Mojolicious command system
-    app->start;
+  # Start the Mojolicious command system
+  app->start;
 
 =head1 DESCRIPTION
 
-L<Mojolicous::Lite> is a micro web framework built around L<Mojolicious>.
+L<Mojolicious::Lite> is a micro real-time web framework built around
+L<Mojolicious>.
 
-A minimal Hello World application looks like this, L<strict> and L<warnings>
-are automatically enabled and a few functions imported when you use
-L<Mojolicious::Lite>, turning your script into a full featured web
-application.
+=head1 TUTORIAL
 
-    #!/usr/bin/env perl
+A quick example driven introduction to the wonders of L<Mojolicious::Lite>.
+Most of what you'll learn here also applies to normal L<Mojolicious>
+applications.
 
-    use Mojolicious::Lite;
+=head2 Hello World
 
-    get '/' => sub { shift->render(text => 'Hello World!') };
+A simple Hello World application can look like this, L<strict>, L<warnings>,
+L<utf8> and Perl 5.10 features are automatically enabled and a few functions
+imported when you use L<Mojolicious::Lite>, turning your script into a full
+featured web application.
 
-    app->start;
+  #!/usr/bin/env perl
+  use Mojolicious::Lite;
+
+  get '/' => sub {
+    my $self = shift;
+    $self->render(text => 'Hello World!');
+  };
+
+  app->start;
+
+=head2 Generator
 
 There is also a helper command to generate a small example application.
 
-    % mojolicious generate lite_app
+  $ mojo generate lite_app
 
-All the normal L<Mojolicious> command options are available from the command
-line.
-Note that CGI, FastCGI and PSGI environments can usually be auto detected and
-will just work without commands.
+=head2 Commands
 
-    % ./myapp.pl daemon
-    Server available at http://127.0.0.1:3000.
+All the normal L<Mojolicious::Commands> are available from the command line.
+Note that CGI and L<PSGI> environments can usually be auto detected and will
+just work without commands.
 
-    % ./myapp.pl daemon --listen http://*:8080
-    Server available at http://127.0.0.1:8080.
+  $ ./myapp.pl daemon
+  Server available at http://127.0.0.1:3000.
 
-    % ./myapp.pl daemon_prefork
-    Server available at http://127.0.0.1:3000.
+  $ ./myapp.pl daemon -l http://*:8080
+  Server available at http://127.0.0.1:8080.
 
-    % ./myapp.pl cgi
-    ...CGI output...
+  $ ./myapp.pl cgi
+  ...CGI output...
 
-    % ./myapp.pl fastcgi
-    ...Blocking FastCGI main loop...
+  $ ./myapp.pl
+  ...List of available commands (or automatically detected environment)...
 
-    % ./myapp.pl
-    ...List of available commands (or automatically detected environment)...
+=head2 Start
 
 The app->start call that starts the L<Mojolicious> command system can be
 customized to override normal C<@ARGV> use.
 
-    app->start('cgi');
+  app->start('cgi');
 
-Your application will automatically reload itself if you set the C<--reload>
-option, so you don't have to restart the server after every change.
+=head2 Reloading
 
-    % ./myapp.pl daemon --reload
-    Server available at http://127.0.0.1:3000.
+Your application will automatically reload itself if you start it with the
+C<morbo> development web server, so you don't have to restart the server after
+every change.
+
+  $ morbo myapp.pl
+  Server available at http://127.0.0.1:3000.
+
+=head2 Routes
 
 Routes are basically just fancy paths that can contain different kinds of
-placeholders.
+placeholders. C<$self> is a L<Mojolicious::Controller> object containing both,
+the HTTP request and response.
 
-    # /foo
-    get '/foo' => sub {
-        my $self = shift;
-        $self->render(text => 'Hello World!');
-    };
+  use Mojolicious::Lite;
+
+  # /foo
+  get '/foo' => sub {
+    my $self = shift;
+    $self->render(text => 'Hello World!');
+  };
+
+  app->start;
+
+=head2 GET/POST parameters
+
+All C<GET> and C<POST> parameters are accessible via
+L<Mojolicious::Controller/"param">.
+
+  use Mojolicious::Lite;
+
+  # /foo?user=sri
+  get '/foo' => sub {
+    my $self = shift;
+    my $user = $self->param('user');
+    $self->render(text => "Hello $user.");
+  };
+
+  app->start;
+
+=head2 Stash and templates
+
+The L<Mojolicious::Controller/"stash"> is used to pass data to templates,
+which can be inlined in the C<DATA> section.
+
+  use Mojolicious::Lite;
+
+  # /bar
+  get '/bar' => sub {
+    my $self = shift;
+    $self->stash(one => 23);
+    $self->render('baz', two => 24);
+  };
+
+  app->start;
+  __DATA__
+
+  @@ baz.html.ep
+  The magic numbers are <%= $one %> and <%= $two %>.
+
+For more information about templates see also
+L<Mojolicious::Guides::Rendering/"Embedded Perl">.
+
+=head2 HTTP
+
+L<Mojolicious::Controller/"req"> and L<Mojolicious::Controller/"res"> give you
+full access to all HTTP features and information.
+
+  use Mojolicious::Lite;
+
+  # /agent
+  get '/agent' => sub {
+    my $self = shift;
+    $self->res->headers->header('X-Bender' => 'Bite my shiny metal ass!');
+    $self->render(text => $self->req->headers->user_agent);
+  };
+
+  app->start;
+
+=head2 Route names
 
 All routes can have a name associated with them, this allows automatic
-template detection and back referencing with C<url_for>, C<link_to> and
-C<form_for>.
-Names are always the last argument, the value C<*> means that the name is
-simply equal to the route without non-word characters.
+template detection and back referencing with
+L<Mojolicious::Controller/"url_for"> as well as many helpers like
+L<Mojolicious::Plugin::TagHelpers/"link_to">. Nameless routes get an
+automatically generated one assigned that is simply equal to the route itself
+without non-word characters.
 
-    # /
-    get '/' => 'index';
+  use Mojolicious::Lite;
 
-    # /foo
-    get '/foo' => '*';
+  # /
+  get '/' => sub {
+    my $self = shift;
+    $self->render;
+  } => 'index';
 
-    # /bar
-    get '/bar' => sub {
-        my $self = shift;
-        $self->render(text => 'Hi!')
-    } => 'bar';
+  # /hello
+  get '/hello';
 
-    __DATA__
+  app->start;
+  __DATA__
 
-    @@ index.html.ep
-    <%= link_to foo => begin %>
-        Foo
-    <% end %>.
-    <%= link_to bar => begin %>
-        Bar
-    <% end %>.
+  @@ index.html.ep
+  <%= link_to Hello  => 'hello' %>.
+  <%= link_to Reload => 'index' %>.
 
-    @@ foo.html.ep
-    <a href="<%= url_for 'index' %>">Home</a>.
+  @@ hello.html.ep
+  Hello World!
 
-Templates can have layouts.
+=head2 Layouts
 
-    # GET /with_layout
-    get '/with_layout' => sub {
-        my $self = shift;
-        $self->render('with_layout', layout => 'green');
-    };
+Templates can have layouts too, you just select one with the helper
+L<Mojolicious::Plugin::DefaultHelpers/"layout"> and place the result of the
+current template with the helper
+L<Mojolicious::Plugin::DefaultHelpers/"content">.
 
-    __DATA__
+  use Mojolicious::Lite;
 
-    @@ with_layout.html.ep
-    We've got content!
+  # /with_layout
+  get '/with_layout' => sub {
+    my $self = shift;
+    $self->render('with_layout');
+  };
 
-    @@ layouts/green.html.ep
-    <!doctype html><html>
-        <head><title>Green!</title></head>
-        <body><%= content %></body>
-    </html>
+  app->start;
+  __DATA__
 
-Template blocks can be reused like functions in Perl scripts.
+  @@ with_layout.html.ep
+  % title 'Green';
+  % layout 'green';
+  Hello World!
 
-    # GET /with_block
-    get '/with_block' => 'block';
+  @@ layouts/green.html.ep
+  <!DOCTYPE html>
+  <html>
+    <head><title><%= title %></title></head>
+    <body><%= content %></body>
+  </html>
 
-    __DATA__
+=head2 Blocks
 
-    @@ block.html.ep
-    <% my $link = begin %>
-        <% my ($url, $name) = @_; %>
-        Try <%= link_to $url => begin %><%= $name %><% end %>!
-    <% end %>
-    <!doctype html><html>
-        <head><title>Sebastians Frameworks!</title></head>
-        <body>
-            <%== $link->('http://mojolicious.org', 'Mojolicious') %>
-            <%== $link->('http://catalystframework.org', 'Catalyst') %>
-        </body>
-    </html>
+Template blocks can be used like normal Perl functions and are always
+delimited by the C<begin> and C<end> keywords.
 
-Templates can also pass around blocks of captured content and extend each
-other.
+  use Mojolicious::Lite;
 
-    # GET /
-    get '/' => 'first';
+  # /with_block
+  get '/with_block' => 'block';
 
-    # GET /second
-    get '/second' => 'second';
+  app->start;
+  __DATA__
 
-    __DATA__
+  @@ block.html.ep
+  % my $link = begin
+    % my ($url, $name) = @_;
+    Try <%= link_to $url => begin %><%= $name %><% end %>.
+  % end
+  <!DOCTYPE html>
+  <html>
+    <head><title>Sebastians frameworks</title></head>
+    <body>
+      %= $link->('http://mojolicio.us', 'Mojolicious')
+      %= $link->('http://catalystframework.org', 'Catalyst')
+    </body>
+  </html>
 
-    @@ first.html.ep
-    <!doctype html><html>
-        <head>
-            <%= content header => begin %>
-                <title>Hi!</title>
-            <% end %>
-        </head>
-        <body>
-            <%= content body => begin %>
-                First page!
-            <% end %>
-        </body>
-    </html>
+=head2 Captured content
 
-    @@ second.html.ep
-    % extends 'first';
-    <% content header => begin %>
-        <title>Howdy!</title>
-    <% end %>
-    <% content body => begin %>
-        Second page!
-    <% end %>
+The helper L<Mojolicious::Plugin::DefaultHelpers/"content_for"> can be used to
+pass around blocks of captured content.
+
+  use Mojolicious::Lite;
+
+  # /captured
+  get '/captured' => sub {
+    my $self = shift;
+    $self->render('captured');
+  };
+
+  app->start;
+  __DATA__
+
+  @@ captured.html.ep
+  % layout 'blue', title => 'Green';
+  % content_for header => begin
+    <meta http-equiv="Pragma" content="no-cache">
+  % end
+  Hello World!
+  % content_for header => begin
+    <meta http-equiv="Expires" content="-1">
+  % end
+
+  @@ layouts/blue.html.ep
+  <!DOCTYPE html>
+  <html>
+    <head>
+      <title><%= title %></title>
+      %= content_for 'header'
+    </head>
+    <body><%= content %></body>
+  </html>
+
+=head2 Helpers
+
+You can also extend L<Mojolicious> with your own helpers, a list of all
+built-in ones can be found in L<Mojolicious::Plugin::DefaultHelpers> and
+L<Mojolicious::Plugin::TagHelpers>.
+
+  use Mojolicious::Lite;
+
+  # "whois" helper
+  helper whois => sub {
+    my $self  = shift;
+    my $agent = $self->req->headers->user_agent || 'Anonymous';
+    my $ip    = $self->tx->remote_address;
+    return "$agent ($ip)";
+  };
+
+  # /secret
+  get '/secret' => sub {
+    my $self = shift;
+    my $user = $self->whois;
+    $self->app->log->debug("Request from $user.");
+  };
+
+  app->start;
+  __DATA__
+
+  @@ secret.html.ep
+  We know who you are <%= whois %>.
+
+=head2 Placeholders
 
 Route placeholders allow capturing parts of a request path until a C</> or
-C<.> separator occurs, results will be stored by name in the C<stash> and
-C<param>.
+C<.> separator occurs, results are accessible via
+L<Mojolicious::Controller/"stash"> and L<Mojolicious::Controller/"param">.
 
-    # /foo/* (everything except "/" and ".")
-    # /foo/test
-    # /foo/test123
-    get '/foo/:bar' => sub {
-        my $self = shift;
-        my $bar  = $self->stash('bar');
-        $self->render(text => "Our :bar placeholder matched $bar");
-    };
+  use Mojolicious::Lite;
 
-    # /*something/foo (everything except "/" and ".")
-    # /test/foo
-    # /test123/foo
-    get '/(:bar)something/foo' => sub {
-        my $self = shift;
-        my $bar  = $self->param('bar');
-        $self->render(text => "Our :bar placeholder matched $bar");
-    };
+  # /foo/test
+  # /foo/test123
+  get '/foo/:bar' => sub {
+    my $self = shift;
+    my $bar  = $self->stash('bar');
+    $self->render(text => "Our :bar placeholder matched $bar");
+  };
+
+  # /testsomething/foo
+  # /test123something/foo
+  get '/(:bar)something/foo' => sub {
+    my $self = shift;
+    my $bar  = $self->param('bar');
+    $self->render(text => "Our :bar placeholder matched $bar");
+  };
+
+  app->start;
+
+=head2 Relaxed Placeholders
 
 Relaxed placeholders allow matching of everything until a C</> occurs.
 
-    # /*/hello (everything except "/")
-    # /test/hello
-    # /test123/hello
-    # /test.123/hello
-    get '/(.you)/hello' => sub {
-        shift->render('groovy');
-    };
+  use Mojolicious::Lite;
 
-    __DATA__
+  # /test/hello
+  # /test123/hello
+  # /test.123/hello
+  get '/#you/hello' => 'groovy';
 
-    @@ groovy.html.ep
-    Your name is <%= $you %>.
+  app->start;
+  __DATA__
 
-Wildcard placeholders allow matching absolutely everything, including
-C</> and C<.>.
+  @@ groovy.html.ep
+  Your name is <%= $you %>.
 
-    # /hello/* (everything)
-    # /hello/test
-    # /hello/test123
-    # /hello/test.123/test/123
-    get '/hello/(*you)' => sub {
-        shift->render('groovy');
-    };
+=head2 Wildcard placeholders
 
-    __DATA__
+Wildcard placeholders allow matching absolutely everything, including C</> and
+C<.>.
 
-    @@ groovy.html.ep
-    Your name is <%= $you %>.
+  use Mojolicious::Lite;
+
+  # /hello/test
+  # /hello/test123
+  # /hello/test.123/test/123
+  get '/hello/*you' => 'groovy';
+
+  app->start;
+  __DATA__
+
+  @@ groovy.html.ep
+  Your name is <%= $you %>.
+
+=head2 HTTP methods
 
 Routes can be restricted to specific request methods.
 
-    # GET /bye
-    get '/bye' => sub { shift->render(text => 'Bye!') };
+  use Mojolicious::Lite;
 
-    # POST /bye
-    post '/bye' => sub { shift->render(text => 'Bye!') };
+  # GET /hello
+  get '/hello' => sub {
+    my $self = shift;
+    $self->render(text => 'Hello World!');
+  };
 
-    # GET|POST|DELETE /bye
-    any [qw/get post delete/] => '/bye' => sub {
-        shift->render(text => 'Bye!');
-    };
+  # PUT /hello
+  put '/hello' => sub {
+    my $self = shift;
+    my $size = length $self->req->body;
+    $self->render(text => "You uploaded $size bytes to /hello.");
+  };
 
-    # /baz
-    any '/baz' => sub {
-        my $self   = shift;
-        my $method = $self->req->method;
-        $self->render(text => "You called /baz with $method");
-    };
+  # GET|POST|PATCH /bye
+  any [qw(GET POST PATCH)] => '/bye' => sub {
+    my $self = shift;
+    $self->render(text => 'Bye World!');
+  };
 
-All placeholders get compiled to a regex internally, with regex constraints
-this process can be easily customized.
+  # * /whatever
+  any '/whatever' => sub {
+    my $self   = shift;
+    my $method = $self->req->method;
+    $self->render(text => "You called /whatever with $method.");
+  };
 
-    # /*
-    any '/:bar' => [bar => qr/\d+/] => sub {
-        my $self = shift;
-        my $bar  = $self->param('bar');
-        $self->render(text => "Our :bar placeholder matched $bar");
-    };
+  app->start;
+
+=head2 Optional placeholders
 
 Routes allow default values to make placeholders optional.
 
-    # /hello/*
-    get '/hello/:name' => {name => 'Sebastian'} => sub {
-        my $self = shift;
-        $self->render('groovy', format => 'txt');
-    };
+  use Mojolicious::Lite;
 
-    __DATA__
+  # /hello
+  # /hello/Sara
+  get '/hello/:name' => {name => 'Sebastian'} => sub {
+    my $self = shift;
+    $self->render('groovy', format => 'txt');
+  };
 
-    @@ groovy.txt.ep
-    My name is <%= $name %>.
+  app->start;
+  __DATA__
 
-All those features can be easily used together.
+  @@ groovy.txt.ep
+  My name is <%= $name %>.
 
-    # /everything/*?name=*
-    get '/everything/:stuff' => [stuff => qr/\d+/] => {stuff => 23} => sub {
-        shift->render('welcome');
-    };
+=head2 Restrictive placeholders
 
-    __DATA__
+The easiest way to make placeholders more restrictive are alternatives, you
+just make a list of possible values.
 
-    @@ welcome.html.ep
-    Stuff is <%= $stuff %>.
-    Query param name is <%= param 'name' %>.
+  use Mojolicious::Lite;
 
-Here's a fully functional example for a html form handling application using
-multiple features at once.
+  # /test
+  # /123
+  any '/:foo' => [foo => [qw(test 123)]] => sub {
+    my $self = shift;
+    my $foo  = $self->param('foo');
+    $self->render(text => "Our :foo placeholder matched $foo");
+  };
 
-    #!/usr/bin/env perl
+  app->start;
 
-    use Mojolicious::Lite;
+All placeholders get compiled to a regular expression internally, this process
+can also be easily customized.
 
-    get '/' => 'index';
+  use Mojolicious::Lite;
 
-    post '/test' => sub {
-        my $self = shift;
+  # /1
+  # /123
+  any '/:bar' => [bar => qr/\d+/] => sub {
+    my $self = shift;
+    my $bar  = $self->param('bar');
+    $self->render(text => "Our :bar placeholder matched $bar");
+  };
 
-        my $groovy = $self->param('groovy') || 'Austin Powers';
-        $groovy =~ s/[^\w\s]+//g;
+  app->start;
 
-        $self->render(
-            template => 'welcome',
-            layout   => 'funky',
-            groovy   => $groovy
-        );
-    } => 'test';
+Just make sure not to use C<^> and C<$> or capturing groups C<(...)>, because
+placeholders become part of a larger regular expression internally, C<(?:...)>
+is fine though.
 
-    app->start;
-    __DATA__
-
-    @@ index.html.ep
-    % layout 'funky';
-    Who is groovy?
-    <%= form_for test => (method => 'post') => begin %>
-        <%= input 'groovy', type => 'text' %>
-        <input type="submit" value="Woosh!" />
-    <% end %>
-
-    @@ welcome.html.ep
-    <%= $groovy %> is groovy!
-    <%= include 'menu' %>
-
-    @@ menu.html.ep
-    <%= link_to index => begin %>
-        Try again
-    <% end %>
-
-    @@ layouts/funky.html.ep
-    <!doctype html><html>
-        <head><title>Funky!</title></head>
-        <body><%= content %>
-        </body>
-    </html>
+=head2 Under
 
 Authentication and code shared between multiple routes can be realized easily
-with the C<under> statement.
-All following routes are only evaluated if the C<under> callback returned a
-true value.
+with bridge routes generated by the C<under> statement. All following routes
+are only evaluated if the callback returned a true value.
 
-    use Mojolicious::Lite;
+  use Mojolicious::Lite;
 
-    # Authenticate based on name parameter
-    under sub {
-        my $self = shift;
+  # Authenticate based on name parameter
+  under sub {
+    my $self = shift;
 
-        # Authenticated
-        my $name = $self->param('name') || '';
-        return 1 if $name eq 'Bender';
+    # Authenticated
+    my $name = $self->param('name') || '';
+    return 1 if $name eq 'Bender';
 
-        # Not authenticated
-        $self->render('denied');
-        return;
+    # Not authenticated
+    $self->render('denied');
+    return undef;
+  };
+
+  # / (with authentication)
+  get '/' => 'index';
+
+  app->start;
+  __DATA__;
+
+  @@ denied.html.ep
+  You are not Bender, permission denied.
+
+  @@ index.html.ep
+  Hi Bender.
+
+Prefixing multiple routes is another good use for C<under>.
+
+  use Mojolicious::Lite;
+
+  # /foo
+  under '/foo';
+
+  # /foo/bar
+  get '/bar' => {text => 'foo bar'};
+
+  # /foo/baz
+  get '/baz' => {text => 'foo baz'};
+
+  # /
+  under '/' => {message => 'whatever'};
+
+  # /bar
+  get '/bar' => {inline => '<%= $message %> works'};
+
+  app->start;
+
+You can also C<group> related routes, which allows nesting of multiple
+C<under> statements.
+
+  use Mojolicious::Lite;
+
+  # Global logic shared by all routes
+  under sub {
+    my $self = shift;
+    return 1 if $self->req->headers->header('X-Bender');
+    $self->render(text => "You're not Bender.");
+    return undef;
+  };
+
+  # Admin section
+  group {
+
+    # Local logic shared only by routes in this group
+    under '/admin' => sub {
+      my $self = shift;
+      return 1 if $self->req->heaers->header('X-Awesome');
+      $self->render(text => "You're not awesome enough.");
+      return undef;
     };
 
-    # GET / (with authentication)
-    get '/' => 'index';
+    # GET /admin/dashboard
+    get '/dashboard' => {text => 'Nothing to see here yet.'};
+  };
 
-    app->start;
-    __DATA__;
+  # GET /welcome
+  get '/welcome' => {text => 'Hi Bender.'};
 
-    @@ denied.html.ep
-    You are not Bender, permission denied!
+  app->start;
 
-    @@ index.html.ep
-    Hi Bender!
-
-Conditions such as C<agent> allow even more powerful route constructs.
-
-    # /foo
-    get '/foo' => (agent => qr/Firefox/) => sub {
-        shift->render(
-            text => 'Congratulations, you are using a cool browser!');
-    }
-
-    # /foo
-    get '/foo' => (agent => qr/Internet Explorer/) => sub {
-        shift->render(
-            text => 'Dude, you really need to upgrade to Firefox!');
-    }
+=head2 Formats
 
 Formats can be automatically detected by looking at file extensions.
 
-    # /detection.html
-    # /detection.txt
-    get '/detection' => sub {
-        my $self = shift;
-        $self->render('detected');
-    };
+  use Mojolicious::Lite;
 
-    __DATA__
+  # /detection.html
+  # /detection.txt
+  get '/detection' => sub {
+    my $self = shift;
+    $self->render('detected');
+  };
 
-    @@ detected.html.ep
-    <!doctype html><html>
-        <head><title>Detected!</title></head>
-        <body>HTML was detected.</body>
-    </html>
 
-    @@ detected.txt.ep
-    TXT was detected.
+  app->start;
+  __DATA__
+
+  @@ detected.html.ep
+  <!DOCTYPE html>
+  <html>
+    <head><title>Detected</title></head>
+    <body>HTML was detected.</body>
+  </html>
+
+  @@ detected.txt.ep
+  TXT was detected.
+
+Restrictive placeholders can also be used.
+
+  use Mojolicious::Lite;
+
+  # /hello.json
+  # /hello.txt
+  get '/hello' => [format => [qw(json txt)]] => sub {
+    my $self = shift;
+    return $self->render_json({hello => 'world'})
+      if $self->stash('format') eq 'json';
+    $self->render_text('hello world');
+  };
+
+  app->start;
+
+Or you can just disable format detection.
+
+  use Mojolicious::Lite;
+
+  # /hello
+  get '/hello' => [format => 0] => {text => 'No format detection.'};
+
+  # Disable detection and allow the following routes selective re-enabling
+  under [format => 0];
+
+  # /foo
+  get '/foo' => {text => 'No format detection again.'};
+
+  # /bar.txt
+  get '/bar' => [format => 'txt'] => {text => ' Just one format.'};
+
+  app->start;
+
+=head2 Content negotiation
+
+For resources with different representations and that require truly C<RESTful>
+content negotiation you can also use L<Mojolicious::Controller/"respond_to">.
+
+  use Mojolicious::Lite;
+
+  # /hello (Accept: application/json)
+  # /hello (Accept: application/xml)
+  # /hello.json
+  # /hello.xml
+  # /hello?format=json
+  # /hello?format=xml
+  get '/hello' => sub {
+    my $self = shift;
+    $self->respond_to(
+      json => {json => {hello => 'world'}},
+      xml  => {text => '<hello>world</hello>'},
+      any  => {data => '', status => 204}
+    );
+  };
+
+  app->start;
+
+MIME type mappings can be extended or changed easily with
+L<Mojolicious/"types">.
+
+  app->types->type(rdf => 'application/rdf+xml');
+
+=head2 Conditions
+
+Conditions such as C<agent> and C<host> from
+L<Mojolicious::Plugin::HeaderCondition> allow even more powerful route
+constructs.
+
+  use Mojolicious::Lite;
+
+  # /foo (Firefox)
+  get '/foo' => (agent => qr/Firefox/) => sub {
+    my $self = shift;
+    $self->render(text => 'Congratulations, you are using a cool browser.');
+  };
+
+  # /foo (Internet Explorer)
+  get '/foo' => (agent => qr/Internet Explorer/) => sub {
+    my $self = shift;
+    $self->render(text => 'Dude, you really need to upgrade to Firefox.');
+  };
+
+  # http://mojolicio.us/bar
+  get '/bar' => (host => 'mojolicio.us') => sub {
+    my $self = shift;
+    $self->render(text => 'Hello Mojolicious.');
+  };
+
+  app->start;
+
+=head2 Sessions
 
 Signed cookie based sessions just work out of the box as soon as you start
-using them.
-The C<flash> can be used to store values that will only be available for the
-next request (unlike C<stash>, which is only available for the current
-request), this is very useful in combination with C<redirect_to>.
+using them through the helper
+L<Mojolicious::Plugin::DefaultHelpers/"session">.
 
-    use Mojolicious::Lite;
+  use Mojolicious::Lite;
 
-    get '/login' => sub {
-        my $self = shift;
-        my $name = $self->param('name') || '';
-        my $pass = $self->param('pass') || '';
-        return $self->render unless $name eq 'sebastian' && $pass eq '1234';
-        $self->session(name => $name);
-        $self->flash(message => 'Thanks for logging in!');
-        $self->redirect_to('index');
-    } => 'login';
+  get '/counter' => sub {
+    my $self = shift;
+    $self->session->{counter}++;
+  };
 
-    get '/' => sub {
-        my $self = shift;
-        return $self->redirect_to('login') unless $self->session('name');
-        $self->render;
-    } => 'index';
+  app->start;
+  __DATA__
 
-    get '/logout' => sub {
-        my $self = shift;
-        $self->session(expires => 1);
-        $self->redirect_to('index');
-    } => 'logout';
+  @@ counter.html.ep
+  Counter: <%= session 'counter' %>
 
-    app->start;
-    __DATA__
+Just be aware that all session data gets serialized with L<Mojo::JSON>.
 
-    @@ layouts/default.html.ep
-    <!doctype html><html>
-        <head><title>Mojolicious rocks!</title></head>
-        <body><%= content %></body>
-    </html>
+=head2 Secret
 
-    @@ login.html.ep
-    % layout 'default';
-    <%= form_for login => begin %>
-        <% if (param 'name') { %>
-            <b>Wrong name or password, please try again.</b><br />
-        <% } %>
-        Name:<br />
-        <%= input name => (type => 'text') %><br />
-        Password:<br />
-        <%= input pass => (type => 'text') %><br />
-        <input type="submit" value="Login" />
-    <% end %>
+Note that you should use a custom L<Mojolicious/"secret"> to make signed
+cookies really secure.
 
-    @@ index.html.ep
-    % layout 'default';
-    <% if (my $message = flash 'message' ) { %>
-        <b><%= $message %></b><br />
-    <% } %>
-    Welcome <%= session 'name' %>!<br />
-    <%= link_to logout => begin %>
-        Logout
-    <% end %>
+  app->secret('My secret passphrase here');
 
-Note that you should use a custom C<secret> to make signed cookies really secure.
+=head2 File uploads
 
-    app->secret('My secret passphrase here!');
+All files uploaded via C<multipart/form-data> request are automatically
+available as L<Mojo::Upload> objects. And you don't have to worry about memory
+usage, because all files above C<250KB> will be automatically streamed into a
+temporary file.
 
-A full featured HTTP 1.1 and WebSocket client is built right in.
-Especially in combination with L<Mojo::JSON> and L<Mojo::DOM> this can be a
-very powerful tool.
+  use Mojolicious::Lite;
 
-    get '/test' => sub {
-        my $self = shift;
-        $self->render(
-            data => $self->client->get('http://mojolicious.org')->res->body);
-    };
+  # Upload form in DATA section
+  get '/' => 'form';
+
+  # Multipart upload handler
+  post '/upload' => sub {
+    my $self = shift;
+
+    # Check file size
+    return $self->render(text => 'File is too big.', status => 200)
+      if $self->req->is_limit_exceeded;
+
+    # Process uploaded file
+    return $self->redirect_to('form')
+      unless my $example = $self->param('example');
+    my $size = $example->size;
+    my $name = $example->filename;
+    $self->render(text => "Thanks for uploading $size byte file $name.");
+  };
+
+  app->start;
+  __DATA__
+
+  @@ form.html.ep
+  <!DOCTYPE html>
+  <html>
+    <head><title>Upload</title></head>
+    <body>
+      %= form_for upload => (enctype => 'multipart/form-data') => begin
+        %= file_field 'example'
+        %= submit_button 'Upload'
+      % end
+    </body>
+  </html>
+
+To protect you from excessively large files there is also a limit of C<5MB> by
+default, which you can tweak with the C<MOJO_MAX_MESSAGE_SIZE> environment
+variable.
+
+  # Increase limit to 1GB
+  $ENV{MOJO_MAX_MESSAGE_SIZE} = 1073741824;
+
+=head2 User agent
+
+With L<Mojolicious::Controller/"ua"> there's a full featured HTTP and
+WebSocket user agent built right in. Especially in combination with
+L<Mojo::JSON> and L<Mojo::DOM> this can be a very powerful tool.
+
+  use Mojolicious::Lite;
+
+  get '/test' => sub {
+    my $self = shift;
+    $self->render(data => $self->ua->get('http://mojolicio.us')->res->body);
+  };
+
+  app->start;
+
+=head2 WebSockets
 
 WebSocket applications have never been this easy before.
 
-    websocket '/echo' => sub {
-        my $self = shift;
-        $self->receive_message(sub {
-            my ($self, $message) = @_;
-            $self->send_message("echo: $message");
-        });
-    };
+  use Mojolicious::Lite;
+
+  websocket '/echo' => sub {
+    my $self = shift;
+    $self->on(message => sub {
+      my ($self, $msg) = @_;
+      $self->send("echo: $msg");
+    });
+  };
+
+  app->start;
+
+The event L<Mojo::Transaction::WebSocket/"message">, which you can subscribe
+to with L<Mojolicious::Controller/"on">, will be emitted for every new
+WebSocket message that is received.
+
+=head2 External templates
 
 External templates will be searched by the renderer in a C<templates>
 directory.
 
-    # /external
-    any '/external' => sub {
-        my $self = shift;
+  use Mojolicious::Lite;
 
-        # templates/foo/bar.html.ep
-        $self->render('foo/bar');
-    };
+  # /external
+  any '/external' => sub {
+    my $self = shift;
 
-Static files will be automatically served from the C<DATA> section
-(even Base 64 encoded) or a C<public> directory if it exists.
+    # templates/foo/bar.html.ep
+    $self->render('foo/bar');
+  };
 
-    @@ something.js
-    alert('hello!');
+  app->start;
 
-    @@ test.txt (base64)
-    dGVzdCAxMjMKbGFsYWxh
+=head2 Static files
 
-    % mkdir public
-    % mv something.js public/something.js
+Static files will be automatically served from the C<DATA> section (even
+Base64 encoded) or a C<public> directory if it exists.
+
+  @@ something.js
+  alert('hello!');
+
+  @@ test.txt (base64)
+  dGVzdCAxMjMKbGFsYWxh
+
+  $ mkdir public
+  $ mv something.js public/something.js
+
+=head2 Testing
 
 Testing your application is as easy as creating a C<t> directory and filling
-it with normal Perl unit tests like C<t/funky.t>.
+it with normal Perl unit tests.
 
-    use Test::More tests => 3;
-    use Test::Mojo;
+  use Test::More;
+  use Test::Mojo;
 
-    use FindBin;
-    $ENV{MOJO_HOME} = "$FindBin::Bin/../";
-    require "$ENV{MOJO_HOME}/myapp.pl";
+  use FindBin;
+  require "$FindBin::Bin/../myapp.pl";
 
-    my $t = Test::Mojo->new;
-    $t->get_ok('/')->status_is(200)->content_like(qr/Funky!/);
+  my $t = Test::Mojo->new;
+  $t->get_ok('/')->status_is(200)->content_like(qr/Funky/);
+
+  done_testing();
 
 Run all unit tests with the C<test> command.
 
-    % ./myapp.pl test
+  $ ./myapp.pl test
 
-To make your tests less noisy you can also change the application log level
-directly in your test files.
+To make your tests more noisy and show you all log messages you can also
+change the application log level directly in your test files.
 
-    $t->app->log->level('error');
+  $t->app->log->level('debug');
 
-To disable debug messages later in a production setup you can change the
-L<Mojolicious> mode, default will be C<development>.
+=head2 Mode
 
-    % ./myapp.pl --mode production
+To disable debug messages later in a production setup, you can change the
+L<Mojolicious> operating mode with command line options or the C<MOJO_MODE>
+environment variable, the default will usually be C<development>.
 
-Log messages will be automatically written to a C<log/$mode.log> file if a
-C<log> directory exists.
+  $ ./myapp.pl daemon -m production
 
-    % mkdir log
+This also affects many other aspects of the framework, such as mode specific
+C<exception> and C<not_found> templates.
 
-For more control the L<Mojolicious> instance can be accessed directly.
+=head2 Logging
 
-    app->log->level('error');
-    app->routes->route('/foo/:bar')->via('get')->to(cb => sub {
-        my $self = shift;
-        $self->render(text => 'Hello Mojo!');
-    });
+L<Mojo::Log> messages will be automatically written to C<STDERR> or a
+C<log/$mode.log> file if a C<log> directory exists.
 
-In case a lite app needs to grow, lite and real L<Mojolicous> applications
-can be easily mixed to make the transition process very smooth.
+  $ mkdir log
 
-    package MyApp::Foo;
-    use base 'Mojolicious::Controller';
+For more control the L<Mojolicious> object can be accessed directly.
 
-    sub index { shift->render(text => 'It works!') }
+  use Mojolicious::Lite;
 
-    package main;
-    use Mojolicious::Lite;
+  app->log->level('error');
+  app->routes->get('/foo/:bar' => sub {
+    my $self = shift;
+    $self->app->log->debug('Got a request for "Hello Mojo!".');
+    $self->render(text => 'Hello Mojo!');
+  });
 
-    get '/bar' => sub { shift->render(text => 'This too!') };
+  app->start;
 
-    app->routes->namespace('MyApp');
-    app->routes->route('/foo/:action')->via('get')->to('foo#index');
+=head2 More
 
-    app->start;
+You can continue with L<Mojolicious::Guides> now, and don't forget to have
+fun!
 
-There is also a helper command to generate a full L<Mojolicious> example that
-will let you explore the astonishing similarities between
-L<Mojolicious::Lite> and L<Mojolicious> applications.
-Both share about 99% of the same code, so almost everything you learned in
-this tutorial applies there too. :)
+=head1 FUNCTIONS
 
-    % mojolicious generate app
+L<Mojolicious::Lite> implements the following functions.
 
-Have fun!
+=head2 any
+
+  my $route = any '/:foo' => sub {...};
+  my $route = any [qw(GET POST)] => '/:foo' => sub {...};
+
+Generate route with L<Mojolicious::Routes::Route/"any">, matching any of the
+listed HTTP request methods or all. See also the tutorial above for more
+argument variations.
+
+=head2 app
+
+  my $app = app;
+
+The L<Mojolicious::Lite> application.
+
+=head2 del
+
+  my $route = del '/:foo' => sub {...};
+
+Generate route with L<Mojolicious::Routes::Route/"delete">, matching only
+C<DELETE> requests. See also the tutorial above for more argument variations.
+
+=head2 get
+
+  my $route = get '/:foo' => sub {...};
+
+Generate route with L<Mojolicious::Routes::Route/"get">, matching only C<GET>
+requests. See also the tutorial above for more argument variations.
+
+=head2 group
+
+  group {...};
+
+Start a new route group.
+
+=head2 helper
+
+  helper foo => sub {...};
+
+Add a new helper with L<Mojolicious/"helper">.
+
+=head2 hook
+
+  hook after_dispatch => sub {...};
+
+Share code with L<Mojolicious/"hook">.
+
+=head2 options
+
+  my $route = options '/:foo' => sub {...};
+
+Generate route with L<Mojolicious::Routes::Route/"options">, matching only
+C<OPTIONS> requests. See also the tutorial above for more argument
+variations.
+
+=head2 patch
+
+  my $route = patch '/:foo' => sub {...};
+
+Generate route with L<Mojolicious::Routes::Route/"patch">, matching only
+C<PATCH> requests. See also the tutorial above for more argument variations.
+
+=head2 plugin
+
+  plugin SomePlugin => {foo => 23};
+
+Load a plugin with L<Mojolicious/"plugin">.
+
+=head2 post
+
+  my $route = post '/:foo' => sub {...};
+
+Generate route with L<Mojolicious::Routes::Route/"post">, matching only
+C<POST> requests. See also the tutorial above for more argument variations.
+
+=head2 put
+
+  my $route = put '/:foo' => sub {...};
+
+Generate route with L<Mojolicious::Routes::Route/"put">, matching only C<PUT>
+requests. See also the tutorial above for more argument variations.
+
+=head2 under
+
+  my $route = under sub {...};
+  my $route = under '/:foo';
+
+Generate bridge route with L<Mojolicious::Routes::Route/"under">, to which all
+following routes are automatically appended. See also the tutorial above for
+more argument variations.
+
+=head2 websocket
+
+  my $route = websocket '/:foo' => sub {...};
+
+Generate route with L<Mojolicious::Routes::Route/"websocket">, matching only
+C<WebSocket> handshakes. See also the tutorial above for more argument
+variations.
 
 =head1 ATTRIBUTES
 
@@ -725,6 +1043,6 @@ L<Mojolicious::Lite> inherits all methods from L<Mojolicious>.
 
 =head1 SEE ALSO
 
-L<Mojolicious>, L<Mojolicious::Guides>, L<http://mojolicious.org>.
+L<Mojolicious>, L<Mojolicious::Guides>, L<http://mojolicio.us>.
 
 =cut

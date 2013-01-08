@@ -1,235 +1,215 @@
 package Mojolicious::Plugins;
+use Mojo::Base 'Mojo::EventEmitter';
 
-use strict;
-use warnings;
+use Mojo::Util 'camelize';
 
-use base 'Mojo::Base';
+has namespaces => sub { ['Mojolicious::Plugin'] };
 
-use Mojo::ByteStream 'b';
+sub emit_hook {
+  my $self = shift;
+  $_->(@_) for @{$self->subscribers(shift)};
+  return $self;
+}
 
-__PACKAGE__->attr(hooks      => sub { {} });
-__PACKAGE__->attr(namespaces => sub { ['Mojolicious::Plugin'] });
+sub emit_chain {
+  my ($self, $name, @args) = @_;
 
-# Who would have thought Hell would really exist?
-# And that it would be in New Jersey?
-sub add_hook {
-    my ($self, $name, $cb) = @_;
+  my $wrapper;
+  for my $cb (reverse @{$self->subscribers($name)}) {
+    my $next = $wrapper;
+    $wrapper = sub { $cb->($next, @args) };
+  }
+  $wrapper->();
 
-    # Shortcut
-    return $self unless $name && $cb;
+  return $self;
+}
 
-    # Add
-    $self->hooks->{$name} ||= [];
-    push @{$self->hooks->{$name}}, $cb;
-
-    return $self;
+sub emit_hook_reverse {
+  my $self = shift;
+  $_->(@_) for reverse @{$self->subscribers(shift)};
+  return $self;
 }
 
 sub load_plugin {
-    my $self = shift;
+  my ($self, $name) = @_;
 
-    # Application
-    my $app = shift;
-    return unless $app;
+  # Try all namespaces
+  my $class = $name =~ /^[a-z]/ ? camelize($name) : $name;
+  for my $namespace (@{$self->namespaces}) {
+    my $module = "${namespace}::$class";
+    return $module->new if $self->_load($module);
+  }
 
-    # Class
-    my $name = shift;
-    return unless $name;
-    my $class = b($name)->camelize->to_string;
+  # Full module name
+  return $name->new if $self->_load($name);
 
-    # Arguments
-    my $args = ref $_[0] ? $_[0] : {@_};
-
-    # Try all namspaces
-    for my $namespace (@{$self->namespaces}) {
-
-        # Module
-        my $module = "${namespace}::$class";
-		
-		next unless my $r = $self->load_plugin_direct( $app, $module, $args );
-		
-		return $r;
-    }
-
-    # Not found
-    die qq/Plugin "$name" missing, maybe you need to install it?\n/;
+  # Not found
+  die qq{Plugin "$name" missing, maybe you need to install it?\n};
 }
 
-sub load_plugin_direct {
-	my $self = shift;
-
-    # Application
-    my $app = shift;
-    return unless $app;
-	
-	# Module
-	my $module = shift;
-    return unless $module;
-	
-	# Arguments
-    my $args = ref $_[0] ? $_[0] : {@_};
-	
-	my $e = Mojo::Loader->load($module);
-    if (ref $e) { die $e }
-	return if $e;
-	
-	# Module is a plugin
-    return unless $module->can('new') && $module->can('register');
-
-	# Register
-    return $module->new->register($app, $args) || 1;
+sub register_plugin {
+  shift->load_plugin(shift)->register(shift, ref $_[0] ? $_[0] : {@_});
 }
 
-sub run_hook {
-    my $self = shift;
+sub _load {
+  my ($self, $module) = @_;
 
-    # Shortcut
-    my $name = shift;
-    return $self unless $name;
-    return unless $self->hooks->{$name};
+  # Load
+  if (my $e = Mojo::Loader->new->load($module)) {
+    ref $e ? die $e : return undef;
+  }
 
-    # Run
-    for my $hook (@{$self->hooks->{$name}}) { $self->$hook(@_) }
-
-    return $self;
-}
-
-sub run_hook_reverse {
-    my $self = shift;
-
-    # Shortcut
-    my $name = shift;
-    return $self unless $name;
-    return unless $self->hooks->{$name};
-
-    # Run
-    for my $hook (reverse @{$self->hooks->{$name}}) { $self->$hook(@_) }
-
-    return $self;
+  # Module is a plugin
+  return $module->isa('Mojolicious::Plugin') ? 1 : undef;
 }
 
 1;
-__END__
 
 =head1 NAME
 
-Mojolicious::Plugins - Plugins
+Mojolicious::Plugins - Plugin manager
 
 =head1 SYNOPSIS
 
-    use Mojolicious::Plugins;
+  use Mojolicious::Plugins;
+
+  my $plugins = Mojolicious::Plugin->new;
+  push @{$plugins->namespaces}, 'MyApp::Plugin';
 
 =head1 DESCRIPTION
 
-L<Mojolicous::Plugins> is the plugin manager of L<Mojolicious>.
-In your application you will usually use it to load plugins.
-To implement your own plugins see L<Mojolicious::Plugin> and the C<add_hook>
-method below.
+L<Mojolicious::Plugins> is the plugin manager of L<Mojolicious>.
+
+=head1 PLUGINS
+
+The following plugins are included in the L<Mojolicious> distribution as
+examples.
+
+=over 2
+
+=item L<Mojolicious::Plugin::Charset>
+
+Change the application charset.
+
+=item L<Mojolicious::Plugin::Config>
+
+Perl-ish configuration files.
+
+=item L<Mojolicious::Plugin::DefaultHelpers>
+
+General purpose helper collection, loaded automatically.
+
+=item L<Mojolicious::Plugin::EPLRenderer>
+
+Renderer for plain embedded Perl templates, loaded automatically.
+
+=item L<Mojolicious::Plugin::EPRenderer>
+
+Renderer for more sophisiticated embedded Perl templates, loaded
+automatically.
+
+=item L<Mojolicious::Plugin::HeaderCondition>
+
+Route condition for all kinds of headers, loaded automatically.
+
+=item L<Mojolicious::Plugin::JSONConfig>
+
+JSON configuration files.
+
+=item L<Mojolicious::Plugin::Mount>
+
+Mount whole L<Mojolicious> applications.
+
+=item L<Mojolicious::Plugin::PODRenderer>
+
+Renderer for turning POD into HTML and documentation browser for
+L<Mojolicious::Guides>.
+
+=item L<Mojolicious::Plugin::PoweredBy>
+
+Add an C<X-Powered-By> header to outgoing responses, loaded automatically.
+
+=item L<Mojolicious::Plugin::RequestTimer>
+
+Log timing information, loaded automatically.
+
+=item L<Mojolicious::Plugin::TagHelpers>
+
+Template specific helper collection, loaded automatically.
+
+=back
+
+=head1 EVENTS
+
+L<Mojolicious::Plugins> inherits all events from L<Mojo::EventEmitter>.
 
 =head1 ATTRIBUTES
 
 L<Mojolicious::Plugins> implements the following attributes.
 
-=head2 C<hooks>
+=head2 namespaces
 
-    my $hooks = $plugins->hooks;
-    $plugins  = $plugins->hooks({foo => [sub {...}]});
+  my $namespaces = $plugins->namespaces;
+  $plugins       = $plugins->namespaces(['Mojolicious::Plugin']);
 
-Hash reference containing all hooks that have been registered by loaded
-plugins.
+Namespaces to load plugins from, defaults to L<Mojolicious::Plugin>.
 
-=head2 C<namespaces>
-
-    my $namespaces = $plugins->namespaces;
-    $plugins       = $plugins->namespaces(['Mojolicious::Plugin']);
-
-Namespaces to load plugins from.
-You can add more namespaces to load application specific plugins.
+  # Add another namespace to load plugins from
+  push @{$plugins->namespaces}, 'MyApp::Plugin';
 
 =head1 METHODS
 
-L<Mojolicious::Plugins> inherits all methods from L<Mojo::Base> and
+L<Mojolicious::Plugins> inherits all methods from L<Mojo::EventEmitter> and
 implements the following new ones.
 
-=head2 C<add_hook>
+=head2 emit_chain
 
-    $plugins = $plugins->add_hook(event => sub {...});
+  $plugins = $plugins->emit_chain('foo');
+  $plugins = $plugins->emit_chain(foo => 123);
 
-Hook into an event.
-The following events are available and run in the listed order.
+Emit events as chained hooks.
 
-=over 4
+=head2 emit_hook
 
-=item after_build_tx
+  $plugins = $plugins->emit_hook('foo');
+  $plugins = $plugins->emit_hook(foo => 123);
 
-Runs right after the transaction is built and before the HTTP request gets
-parsed.
-One usage case would be upload progress bars.
-(Passed the transaction instance)
+Emit events as hooks.
 
-    $plugins->add_hook(before_request => sub {
-        my ($self, $tx) = @_;
-    });
+=head2 emit_hook_reverse
 
-=item before_dispatch
+  $plugins = $plugins->emit_hook_reverse('foo');
+  $plugins = $plugins->emit_hook_reverse(foo => 123);
 
-Runs before the dispatchers determines what action to run.
-(Passed the default controller instance)
+Emit events as hooks in reverse order.
 
-    $plugins->add_hook(before_dispatch => sub {
-        my ($self, $c) = @_;
-    });
+=head2 load_plugin
 
-=item after_static_dispatch
+  my $plugin = $plugins->load_plugin('some_thing');
+  my $plugin = $plugins->load_plugin('SomeThing');
+  my $plugin = $plugins->load_plugin('MyApp::Plugin::SomeThing');
 
-Runs after the static dispatcher determines if a static file should be
-served. (Passed the default controller instance)
-Note that the callbacks of this hook run in reverse order.
+Load a plugin from the configured namespaces or by full module name.
 
-    $plugins->add_hook(after_static_dispatch => sub {
-        my ($self, $c) = @_;
-    });
+=head2 register_plugin
 
-=item after_dispatch
+  $plugins->register_plugin('some_thing', Mojolicious->new);
+  $plugins->register_plugin('some_thing', Mojolicious->new, foo => 23);
+  $plugins->register_plugin('some_thing', Mojolicious->new, {foo => 23});
+  $plugins->register_plugin('SomeThing', Mojolicious->new);
+  $plugins->register_plugin('SomeThing', Mojolicious->new, foo => 23);
+  $plugins->register_plugin('SomeThing', Mojolicious->new, {foo => 23});
+  $plugins->register_plugin('MyApp::Plugin::SomeThing', Mojolicious->new);
+  $plugins->register_plugin(
+    'MyApp::Plugin::SomeThing', Mojolicious->new, foo => 23);
+  $plugins->register_plugin(
+    'MyApp::Plugin::SomeThing', Mojolicious->new, {foo => 23});
 
-Runs after the dispatchers determines what action to run.
-(Passed the default controller instance)
-Note that the callbacks of this hook run in reverse order.
-
-    $plugins->add_hook(after_dispatch => sub {
-        my ($self, $c) = @_;
-    });
-
-=back
-
-You could also add custom events by using C<run_hook> and C<run_hook_reverse>
-in your application.
-
-=head2 C<load_plugin>
-
-    $plugins = $plugins->load_plugin($app, 'something');
-    $plugins = $plugins->load_plugin($app, 'something', foo => 23);
-    $plugins = $plugins->load_plugin($app, 'something', {foo => 23});
-
-Load a plugin from the configured namespaces and run C<register>.
-Optional arguments are passed to register.
-
-=head2 C<run_hook>
-
-    $plugins = $plugins->run_hook('foo');
-    $plugins = $plugins->run_hook(foo => 123);
-
-Runs a hook.
-
-=head2 C<run_hook_reverse>
-
-    $plugins = $plugins->run_hook_reverse('foo');
-    $plugins = $plugins->run_hook_reverse(foo => 123);
-
-Runs a hook in reverse order.
+Load a plugin from the configured namespaces or by full module name and run
+C<register>, optional arguments are passed through.
 
 =head1 SEE ALSO
 
-L<Mojolicious>, L<Mojolicious::Guides>, L<http://mojolicious.org>.
+L<Mojolicious>, L<Mojolicious::Guides>, L<http://mojolicio.us>.
 
 =cut

@@ -1,313 +1,190 @@
-#!/usr/bin/env perl
+use Mojo::Base -strict;
 
-use strict;
-use warnings;
+# Disable IPv6 and libev
+BEGIN {
+  $ENV{MOJO_NO_IPV6} = 1;
+  $ENV{MOJO_REACTOR} = 'Mojo::Reactor::Poll';
+}
 
-# Disable epoll, kqueue and IPv6
-BEGIN { $ENV{MOJO_POLL} = $ENV{MOJO_NO_IPV6} = 1 }
-
-use Mojo::IOLoop;
 use Test::More;
-
-# Make sure sockets are working
-plan skip_all => 'working sockets required for this test!'
-  unless Mojo::IOLoop->new->generate_port;
-plan tests => 27;
-
-# Oh, dear. She’s stuck in an infinite loop and he’s an idiot.
-# Well, that’s love for you.
-use IO::Socket::INET;
+use Mojo::ByteStream 'b';
 use Mojolicious::Lite;
-use Mojo::Client;
-
-# Mojolicious::Lite and ojo
-use ojo;
-
-# Silence
-app->log->level('fatal');
-
-# Avoid exception template
-app->renderer->root(app->home->rel_dir('public'));
-
-# WebSocket /
-my $flag;
-websocket '/' => sub {
-    my $self = shift;
-    $self->finished(sub { $flag += 4 });
-    $self->receive_message(
-        sub {
-            my ($self, $message) = @_;
-            $self->send_message("${message}test2");
-            $flag = 20;
-        }
-    );
-};
-
-# WebSocket /socket
-websocket '/socket' => sub {
-    my $self = shift;
-    $self->send_message(scalar $self->req->headers->host);
-    $self->finish;
-};
-
-# WebSocket /early_start
-websocket '/early_start' => sub {
-    my $self = shift;
-    $self->send_message('test1');
-    $self->receive_message(
-        sub {
-            my ($self, $message) = @_;
-            $self->send_message("${message}test2");
-            $self->finish;
-        }
-    );
-};
-
-# WebSocket /denied
-my ($handshake, $denied) = 0;
-websocket '/denied' => sub {
-    my $self = shift;
-    $self->tx->handshake->finished(sub { $handshake += 2 });
-    $self->finished(sub                { $denied    += 1 });
-    $self->render(text => 'denied', status => 403);
-};
-
-# WebSocket /subreq
-my $subreq = 0;
-websocket '/subreq' => sub {
-    my $self = shift;
-    $self->client->async->websocket(
-        '/echo' => sub {
-            my $client = shift;
-            $client->receive_message(
-                sub {
-                    my ($client, $message) = @_;
-                    $self->send_message($message);
-                    $client->finish;
-                    $self->finish;
-                }
-            );
-            $client->send_message('test1');
-        }
-    )->process;
-    $self->send_message('test0');
-    $self->finished(sub { $subreq += 3 });
-};
+use Test::Mojo;
 
 # WebSocket /echo
 websocket '/echo' => sub {
-    shift->receive_message(
-        sub {
-            my ($self, $message) = @_;
-            $self->send_message($message);
-        }
-    );
-};
-
-# WebSocket /dead
-websocket '/dead' => sub { die 'i see dead processes' };
-
-# WebSocket /foo
-websocket '/foo' =>
-  sub { shift->rendered->res->code('403')->message("i'm a teapot") };
-
-# WebSocket /deadcallback
-websocket '/deadcallback' => sub {
-    my $self = shift;
-    $self->receive_message(sub { die 'i see dead callbacks' });
-};
-
-my $client = Mojo::Client->singleton->app(app);
-
-# WebSocket /
-my $result;
-$client->websocket(
-    '/' => sub {
-        my $self = shift;
-        $self->receive_message(
-            sub {
-                my ($self, $message) = @_;
-                $result = $message;
-                $self->finish;
-            }
-        );
-        $self->send_message('test1');
+  my $self = shift;
+  $self->on(
+    message => sub {
+      my ($self, $msg) = @_;
+      $self->send("echo: $msg");
     }
-)->process;
-is($result, 'test1test2', 'right result');
-
-# WebSocket / (ojo)
-$result = undef;
-w '/' => sub {
-    shift->receive_message(
-        sub {
-            shift->finish;
-            $result = shift;
-        }
-    )->send_message('test1');
+  );
 };
-is($result, 'test1test2', 'right result');
 
-# WebSocket /socket (using an already prepared socket)
-my $peer  = $client->test_server;
-my $local = $client->ioloop->generate_port;
-$result = undef;
-my $tx     = $client->build_websocket_tx('ws://lalala/socket');
-my $socket = IO::Socket::INET->new(
-    PeerAddr  => 'localhost',
-    PeerPort  => $peer,
-    LocalPort => $local
+# GET /echo
+get '/echo' => {text => 'plain echo!'};
+
+# GET /plain
+get '/plain' => {text => 'Nothing to see here!'};
+
+# WebSocket /push
+websocket '/push' => sub {
+  my $self = shift;
+  my $id = Mojo::IOLoop->recurring(0.1 => sub { $self->send('push') });
+  $self->on(finish => sub { Mojo::IOLoop->remove($id) });
+};
+
+# WebSocket /unicode
+websocket '/unicode' => sub {
+  my $self = shift;
+  $self->on(
+    message => sub {
+      my ($self, $msg) = @_;
+      $self->send("♥: $msg");
+    }
+  );
+};
+
+# WebSocket /bytes
+websocket '/bytes' => sub {
+  my $self = shift;
+  $self->tx->on(
+    frame => sub {
+      my ($ws, $frame) = @_;
+      $ws->send({$frame->[4] == 2 ? 'binary' : 'text', $frame->[5]});
+    }
+  );
+  $self->rendered(101);
+};
+
+# WebSocket /once
+websocket '/once' => sub {
+  my $self = shift;
+  $self->on(
+    message => sub {
+      my ($self, $msg) = @_;
+      $self->send("ONE: $msg");
+    }
+  );
+  $self->tx->once(
+    message => sub {
+      my ($tx, $msg) = @_;
+      $self->send("TWO: $msg");
+    }
+  );
+};
+
+# /nested
+under '/nested';
+
+# WebSocket /nested
+websocket sub {
+  my $self = shift;
+  $self->on(
+    message => sub {
+      my ($self, $msg) = @_;
+      $self->send("nested echo: $msg");
+    }
+  );
+};
+
+# GET /nested
+get {text => 'plain nested!'};
+
+# POST /nested
+post {data => 'plain nested too!'};
+
+my $t = Test::Mojo->new;
+
+# WebSocket /echo (default protocol)
+$t->websocket_ok('/echo')->header_is('Sec-WebSocket-Protocol' => 'mojo')
+  ->send_ok('hello')->message_is('echo: hello')->finish_ok;
+
+# WebSocket /echo (multiple times)
+$t->websocket_ok('/echo')->send_ok('hello again')
+  ->message_is('echo: hello again')->send_ok('and one more time')
+  ->message_is('echo: and one more time')->finish_ok;
+
+# WebSocket /echo (with custom protocol)
+$t->websocket_ok('/echo', {'Sec-WebSocket-Protocol' => 'foo, bar, baz'})
+  ->header_is('Sec-WebSocket-Protocol' => 'foo')->send_ok('hello')
+  ->message_is('echo: hello')->finish_ok;
+
+# WebSocket /echo (zero)
+$t->websocket_ok('/echo')->send_ok(0)->message_is('echo: 0')->finish_ok;
+
+# GET /echo (plain alternative)
+$t->get_ok('/echo')->status_is(200)->content_is('plain echo!');
+
+# GET /plain
+$t->get_ok('/plain')->status_is(200)->content_is('Nothing to see here!');
+
+# WebSocket /push
+$t->websocket_ok('/push')->message_is('push')->message_is('push')
+  ->message_is('push')->finish_ok;
+
+# WebSocket /push (again)
+$t->websocket_ok('/push')->message_unlike(qr/shift/)->message_isnt('shift')
+  ->message_like(qr/us/)->finish_ok;
+
+# GET /plain (again)
+$t->get_ok('/plain')->status_is(200)->content_is('Nothing to see here!');
+
+# WebSocket /echo (again)
+$t->websocket_ok('/echo')->send_ok('hello')->message_is('echo: hello')
+  ->finish_ok;
+
+# WebSocket /echo (mixed)
+$t->websocket_ok('/echo')->send_ok('this')->send_ok('just')->send_ok('works')
+  ->message_is('echo: this')->message_is('echo: just')
+  ->message_is('echo: works')->finish_ok;
+
+# GET /plain (and again)
+$t->get_ok('/plain')->status_is(200)->content_is('Nothing to see here!');
+
+# WebSocket /unicode
+$t->websocket_ok('/unicode')->send_ok('hello')->message_is('♥: hello')
+  ->finish_ok;
+
+# WebSocket /unicode (multiple times)
+$t->websocket_ok('/unicode')->send_ok('hello again')
+  ->message_is('♥: hello again')->send_ok('and one ☃ more time')
+  ->message_is('♥: and one ☃ more time')->finish_ok;
+
+# WebSocket /bytes (binary frame and frame event)
+my $bytes = b("I ♥ Mojolicious")->encode('UTF-16LE')->to_string;
+$t->websocket_ok('/bytes');
+my $binary;
+$t->tx->on(
+  frame => sub {
+    my ($ws, $frame) = @_;
+    $binary++ if $frame->[4] == 2;
+  }
 );
-$tx->connection($socket);
-my $port;
-$client->process(
-    $tx => sub {
-        my $self = shift;
-        $self->receive_message(
-            sub {
-                my ($self, $message) = @_;
-                $result = $message;
-                $self->finish;
-            }
-        );
-        $port = $self->ioloop->local_info($self->tx->connection)->{port};
-    }
-)->process;
-is($result, 'lalala', 'right result');
-is($port,   $local,   'right local port');
+$t->send_ok({binary => $bytes})->message_is($bytes);
+ok $binary, 'received binary frame';
+$binary = undef;
+$t->send_ok({text => $bytes})->message_is($bytes)->finish_ok;
+ok !$binary, 'received text frame';
 
-# WebSocket /early_start (server directly sends a message)
-my $flag2;
-$result = undef;
-$client->websocket(
-    '/early_start' => sub {
-        my $self = shift;
-        $self->finished(sub { $flag2 += 5 });
-        $self->receive_message(
-            sub {
-                my ($self, $message) = @_;
-                $result = $message;
-                $self->send_message('test3');
-                $flag2 = 18;
-            }
-        );
-    }
-)->process;
-is($result, 'test3test2', 'right result');
-is($flag2,  23,           'finished callback');
+# WebSocket /bytes (multiple times)
+$t->websocket_ok('/bytes')->send_ok({binary => $bytes})->message_is($bytes)
+  ->send_ok({binary => $bytes})->message_is($bytes)->finish_ok;
 
-# WebSocket /denied (connection denied)
-my $code = undef;
-$client->websocket('/denied' => sub { $code = shift->res->code })->process;
-is($code,      403, 'right status');
-is($handshake, 2,   'finished handshake');
-is($denied,    1,   'finished websocket');
+# WebSocket /once
+$t->websocket_ok('/once')->send_ok('hello')->message_is('ONE: hello')
+  ->message_is('TWO: hello')->send_ok('hello')->message_is('ONE: hello')
+  ->send_ok('hello')->message_is('ONE: hello')->finish_ok;
 
-# WebSocket /subreq
-my $finished = 0;
-($code, $result) = undef;
-$client->websocket(
-    '/subreq' => sub {
-        my $self = shift;
-        $code   = $self->res->code;
-        $result = '';
-        $self->receive_message(
-            sub {
-                my ($self, $message) = @_;
-                $result .= $message;
-                $self->finish if $message eq 'test1';
-            }
-        );
-        $self->finished(sub { $finished += 4 });
-    }
-)->process;
-is($code,     101,          'right status');
-is($result,   'test0test1', 'right result');
-is($finished, 4,            'finished client websocket');
-is($subreq,   3,            'finished server websocket');
+# WebSocket /nested
+$t->websocket_ok('/nested')->send_ok('hello')
+  ->message_is('nested echo: hello')->finish_ok;
 
-# WebSocket /subreq (async)
-my $running = 2;
-my ($code2, $result2);
-($code, $result) = undef;
-$client->async->websocket(
-    '/subreq' => sub {
-        my $self = shift;
-        $code   = $self->res->code;
-        $result = '';
-        $self->receive_message(
-            sub {
-                my ($self, $message) = @_;
-                $result .= $message;
-                $self->finish and $running-- if $message eq 'test1';
-                $self->ioloop->idle_cb(sub { shift->stop }) unless $running;
-            }
-        );
-        $self->finished(sub { $finished += 1 });
-    }
-)->process;
-$client->async->websocket(
-    '/subreq' => sub {
-        my $self = shift;
-        $code2   = $self->res->code;
-        $result2 = '';
-        $self->receive_message(
-            sub {
-                my ($self, $message) = @_;
-                $result2 .= $message;
-                $self->finish and $running-- if $message eq 'test1';
-                $self->ioloop->idle_cb(sub { shift->stop }) unless $running;
-            }
-        );
-        $self->finished(sub { $finished += 2 });
-    }
-)->process;
-$client->ioloop->start;
-is($code,     101,          'right status');
-is($result,   'test0test1', 'right result');
-is($code2,    101,          'right status');
-is($result2,  'test0test1', 'right result');
-is($finished, 7,            'finished client websocket');
-is($subreq,   9,            'finished server websocket');
+# GET /nested (plain alternative)
+$t->get_ok('/nested')->status_is(200)->content_is('plain nested!');
 
-# WebSocket /dead (dies)
-$code = undef;
-my ($done, $websocket, $message);
-$client->websocket(
-    '/dead' => sub {
-        my $self = shift;
-        $done      = $self->tx->is_done;
-        $websocket = $self->tx->is_websocket;
-        $code      = $self->res->code;
-        $message   = $self->res->message;
-    }
-)->process;
-is($done,      1,                       'transaction is done');
-is($websocket, 0,                       'no websocket');
-is($code,      500,                     'right status');
-is($message,   'Internal Server Error', 'right message');
+# POST /nested (another plain alternative)
+$t->post_ok('/nested')->status_is(200)->content_is('plain nested too!');
 
-# WebSocket /foo (forbidden)
-($websocket, $code, $message) = undef;
-$client->websocket(
-    '/foo' => sub {
-        my $self = shift;
-        $websocket = $self->tx->is_websocket;
-        $code      = $self->res->code;
-        $message   = $self->res->message;
-    }
-)->process;
-is($websocket, 0,              'no websocket');
-is($code,      403,            'right status');
-is($message,   "i'm a teapot", 'right message');
-
-# WebSocket /deadcallback (dies in callback)
-$client->websocket(
-    '/deadcallback' => sub {
-        my $self = shift;
-        $self->send_message('test1');
-    }
-)->process;
-
-# Server side "finished" callback
-is($flag, 24, 'finished callback');
+done_testing();

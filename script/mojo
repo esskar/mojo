@@ -3,31 +3,27 @@
 use strict;
 use warnings;
 
-use File::Basename 'dirname';
-use File::Spec;
+use FindBin;
+use lib "$FindBin::Bin/../lib";
 
-use lib join '/', File::Spec->splitdir(dirname(__FILE__)), 'lib';
-use lib join '/', File::Spec->splitdir(dirname(__FILE__)), '..', 'lib';
-
-# Check if Mojo is installed
-eval 'use Mojo::Commands';
-die <<EOF if $@;
-It looks like you don't have the Mojo Framework installed.
-Please visit http://mojolicious.org for detailed installation instructions.
-
-EOF
-
-# Start the command system
-Mojo::Commands->start;
-
-__END__
+require Mojolicious::Commands;
+Mojolicious::Commands->start_app('Mojo::HelloWorld');
 
 =head1 NAME
 
-mojo - The Mojo Command System
+mojo - The Mojolicious command system
+
+=head1 SYNOPSIS
+
+  $ mojo --help
+
+=head1 DESCRIPTION
+
+List and run L<Mojolicious> commands as described in
+L<Mojolicious::Commands>.
 
 =head1 SEE ALSO
 
-L<Mojolicious>, L<Mojolicious::Guides>, L<http://mojolicious.org>.
+L<Mojolicious>, L<Mojolicious::Guides>, L<http://mojolicio.us>.
 
 =cut

@@ -1,99 +1,124 @@
 package Mojo::Asset;
-
-use strict;
-use warnings;
-
-use base 'Mojo::Base';
+use Mojo::Base 'Mojo::EventEmitter';
 
 use Carp 'croak';
 
-__PACKAGE__->attr('end_range');
-__PACKAGE__->attr(start_range => 0);
+has 'end_range';
+has start_range => 0;
 
-# Marge, it takes two to lie. One to lie and one to listen.
 sub add_chunk { croak 'Method "add_chunk" not implemented by subclass' }
 sub contains  { croak 'Method "contains" not implemented by subclass' }
 sub get_chunk { croak 'Method "get_chunk" not implemented by subclass' }
-sub move_to   { croak 'Method "move_to" not implemented by subclass' }
-sub size      { croak 'Method "size" not implemented by subclass' }
-sub slurp     { croak 'Method "slurp" not implemented by subclass' }
+
+sub is_file {undef}
+
+sub is_range { !!($_[0]->end_range || $_[0]->start_range) }
+
+sub move_to { croak 'Method "move_to" not implemented by subclass' }
+sub size    { croak 'Method "size" not implemented by subclass' }
+sub slurp   { croak 'Method "slurp" not implemented by subclass' }
 
 1;
-__END__
 
 =head1 NAME
 
-Mojo::Asset - Asset Base Class
+Mojo::Asset - HTTP content storage base class
 
 =head1 SYNOPSIS
 
-    use base 'Mojo::Asset';
+  package Mojo::Asset::MyAsset;
+  use Mojo::Base 'Mojo::Asset';
+
+  sub add_chunk {...}
+  sub contains  {...}
+  sub get_chunk {...}
+  sub move_to   {...}
+  sub size      {...}
+  sub slurp     {...}
 
 =head1 DESCRIPTION
 
-L<Mojo::Asset> is an abstract base class for assets.
+L<Mojo::Asset> is an abstract base class for HTTP content storage.
+
+=head1 EVENTS
+
+L<Mojo::Asset> inherits all events from L<Mojo::EventEmitter>.
 
 =head1 ATTRIBUTES
 
 L<Mojo::Asset> implements the following attributes.
 
-=head2 C<end_range>
+=head2 end_range
 
-    my $end = $asset->end_range;
-    $asset  = $asset->end_range(8);
+  my $end = $asset->end_range;
+  $asset  = $asset->end_range(8);
 
 Pretend file ends earlier.
 
-=head2 C<start_range>
+=head2 start_range
 
-    my $start = $asset->start_range;
-    $asset    = $asset->start_range(0);
+  my $start = $asset->start_range;
+  $asset    = $asset->start_range(0);
 
 Pretend file starts later.
 
 =head1 METHODS
 
-L<Mojo::Asset> inherits all methods from L<Mojo::Base> and implements the
-following new ones.
+L<Mojo::Asset> inherits all methods from L<Mojo::EventEmitter> and implements
+the following new ones.
 
-=head2 C<add_chunk>
+=head2 add_chunk
 
-    $asset = $asset->add_chunk('foo bar baz');
+  $asset = $asset->add_chunk('foo bar baz');
 
-Add chunk of data to asset.
+Add chunk of data to asset. Meant to be overloaded in a subclass.
 
-=head2 C<contains>
+=head2 contains
 
-    my $position = $asset->contains('bar');
+  my $position = $asset->contains('bar');
 
-Check if asset contains a specific string.
+Check if asset contains a specific string. Meant to be overloaded in a
+subclass.
 
-=head2 C<get_chunk>
+=head2 get_chunk
 
-    my $chunk = $asset->get_chunk($offset);
+  my $chunk = $asset->get_chunk($offset);
 
-Get chunk of data starting from a specific position.
+Get chunk of data starting from a specific position. Meant to be overloaded
+in a subclass.
 
-=head2 C<move_to>
+=head2 is_file
 
-    $asset = $asset->move_to('/foo/bar/baz.txt');
+  my $false = $asset->is_file;
 
-Move asset data into a specific file.
+False.
 
-=head2 C<size>
+=head2 is_range
 
-    my $size = $asset->size;
+  my $success = $asset->is_range;
 
-Size of asset data in bytes.
+Check if asset has a C<start_range> or C<end_range>.
 
-=head2 C<slurp>
+=head2 move_to
 
-    my $string = $file->slurp;
+  $asset = $asset->move_to('/home/sri/foo.txt');
 
-Read all asset data at once.
+Move asset data into a specific file. Meant to be overloaded in a subclass.
+
+=head2 size
+
+  my $size = $asset->size;
+
+Size of asset data in bytes. Meant to be overloaded in a subclass.
+
+=head2 slurp
+
+  my $string = $asset->slurp;
+
+Read all asset data at once. Meant to be overloaded in a subclass.
 
 =head1 SEE ALSO
 
-L<Mojolicious>, L<Mojolicious::Guides>, L<http://mojolicious.org>.
+L<Mojolicious>, L<Mojolicious::Guides>, L<http://mojolicio.us>.
 
 =cut

@@ -1,74 +1,61 @@
 package Mojolicious::Plugin::PoweredBy;
+use Mojo::Base 'Mojolicious::Plugin';
 
-use strict;
-use warnings;
-
-use base 'Mojolicious::Plugin';
-
-# It's just like the story of the grasshopper and the octopus.
-# All year long, the grasshopper kept burying acorns for the winter,
-# while the octopus mooched off his girlfriend and watched TV.
-# But then the winter came, and the grasshopper died,
-# and the octopus ate all his acorns.
-# And also he got a racecar. Is any of this getting through to you?
 sub register {
-    my ($self, $app, $args) = @_;
-
-    # Name
-    my $name = $args->{name} || 'Mojolicious (Perl)';
-
-    # Add header
-    $app->plugins->add_hook(
-        after_build_tx => sub {
-            my ($self, $tx) = @_;
-            $tx->res->headers->header('X-Powered-By' => $name);
-        }
-    );
+  my ($self, $app, $conf) = @_;
+  my $name = $conf->{name} || 'Mojolicious (Perl)';
+  $app->hook(before_dispatch =>
+      sub { shift->res->headers->header('X-Powered-By' => $name) });
 }
 
 1;
-__END__
 
 =head1 NAME
 
-Mojolicious::Plugin::PoweredBy - Powered By Plugin
+Mojolicious::Plugin::PoweredBy - Powered by plugin
 
 =head1 SYNOPSIS
 
-    # Mojolicious
-    $self->plugin('powered_by');
-    $self->plugin(powered_by => (name => 'MyApp 1.0'));
+  # Mojolicious
+  $self->plugin('PoweredBy');
+  $self->plugin(PoweredBy => (name => 'MyApp 1.0'));
 
-    # Mojolicious::Lite
-    plugin 'powered_by';
-    plugin powered_by => (name => 'MyApp 1.0');
+  # Mojolicious::Lite
+  plugin 'PoweredBy';
+  plugin PoweredBy => (name => 'MyApp 1.0');
 
 =head1 DESCRIPTION
 
-L<Mojolicous::Plugin::PoweredBy> is a plugin that adds an C<X-Powered-By>
+L<Mojolicious::Plugin::PoweredBy> is a plugin that adds an C<X-Powered-By>
 header which defaults to C<Mojolicious (Perl)>.
 
-=head2 Options
+This is a core plugin, that means it is always enabled and its code a good
+example for learning to build new plugins, you're welcome to fork it.
 
-=over 4
+=head1 OPTIONS
 
-=item powered_by
+L<Mojolicious::Plugin::PoweredBy> supports the following options.
 
-=back
+=head2 name
+
+  plugin PoweredBy => (name => 'MyApp 1.0');
+
+Value for C<X-Powered-By> header, defaults to C<Mojolicious (Perl)>.
 
 =head1 METHODS
 
 L<Mojolicious::Plugin::PoweredBy> inherits all methods from
 L<Mojolicious::Plugin> and implements the following new ones.
 
-=head2 C<register>
+=head2 register
 
-    $plugin->register;
+  $plugin->register(Mojolicious->new);
+  $plugin->register(Mojolicious->new, {name => 'MyFramework 1.0'});
 
-Register plugin hooks in L<Mojolicious> application.
+Register hooks in L<Mojolicious> application.
 
 =head1 SEE ALSO
 
-L<Mojolicious>, L<Mojolicious::Guides>, L<http://mojolicious.org>.
+L<Mojolicious>, L<Mojolicious::Guides>, L<http://mojolicio.us>.
 
 =cut

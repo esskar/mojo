@@ -1,132 +1,128 @@
 package Mojo::Server::PSGI;
+use Mojo::Base 'Mojo::Server';
 
-use strict;
-use warnings;
-
-use base 'Mojo::Server';
-
-use constant CHUNK_SIZE => $ENV{MOJO_CHUNK_SIZE} || 262144;
-
-# Things aren't as happy as they used to be down here at the unemployment
-# office.
-# Joblessness is no longer just for philosophy majors.
-# Useful people are starting to feel the pinch.
 sub run {
-    my ($self, $env) = @_;
+  my ($self, $env) = @_;
 
-    my $tx  = $self->build_tx_cb->($self);
-    my $req = $tx->req;
+  # Environment
+  my $tx  = $self->build_tx;
+  my $req = $tx->req->parse($env);
 
-    # Environment
-    $req->parse($env);
+  # Store connection information
+  $tx->local_port($env->{SERVER_PORT})->remote_address($env->{REMOTE_ADDR});
 
-    # Store connection information
-    $tx->remote_address($env->{REMOTE_ADDR});
-    $tx->local_port($env->{SERVER_PORT});
+  # Request body
+  my $len = $env->{CONTENT_LENGTH};
+  until ($req->is_finished) {
+    my $chunk = ($len && $len < 131072) ? $len : 131072;
+    last unless my $read = $env->{'psgi.input'}->read(my $buffer, $chunk, 0);
+    $req->parse($buffer);
+    last if ($len -= $read) <= 0;
+  }
 
-    # Request body
-    while (!$req->is_done) {
-        my $read = $env->{'psgi.input'}->read(my $buffer, CHUNK_SIZE, 0);
-        last if $read == 0;
-        $req->parse($buffer);
-    }
+  # Handle
+  $self->emit(request => $tx);
 
-    # Handle
-    $self->handler_cb->($self, $tx);
+  # Response headers
+  my $res     = $tx->res->fix_headers;
+  my $headers = $res->content->headers;
+  my @headers;
+  for my $name (@{$headers->names}) {
+    push @headers, $name => $_ for map {@$_} $headers->header($name);
+  }
 
-    my $res = $tx->res;
-
-    # Status
-    my $status = $res->code;
-
-    # Response headers
-    $res->fix_headers;
-    my $headers = $res->content->headers;
-    my @headers;
-    for my $name (@{$headers->names}) {
-        my $value = $headers->header($name);
-        push @headers, $name => $value;
-    }
-
-    # Response body
-    my $body = Mojo::Server::PSGI::_Handle->new(_res => $res);
-
-    # Finish transaction
-    $tx->finished->($tx);
-
-    return [$status, \@headers, $body];
+  # PSGI response
+  return [$res->code || 404,
+    \@headers, Mojo::Server::PSGI::_IO->new(tx => $tx)];
 }
 
-package Mojo::Server::PSGI::_Handle;
+sub to_psgi_app {
+  my $self = shift;
 
-use strict;
-use warnings;
+  # Preload application and wrap it
+  $self->app;
+  return sub { $self->run(@_) }
+}
 
-use base 'Mojo::Base';
+package Mojo::Server::PSGI::_IO;
+use Mojo::Base -base;
 
-__PACKAGE__->attr(_offset => 0);
-__PACKAGE__->attr('_res');
-
-sub close { }
+sub close { shift->{tx}->server_close }
 
 sub getline {
-    my $self = shift;
+  my $self = shift;
 
-    # Blocking read
-    my $offset = $self->_offset;
-    while (1) {
-        my $chunk = $self->_res->get_body_chunk($offset);
+  # No content yet, try again later
+  my $chunk = $self->{tx}->res->get_body_chunk($self->{offset} //= 0);
+  return '' unless defined $chunk;
 
-        # No content yet, try again
-        unless (defined $chunk) {
-            sleep 1;
-            next;
-        }
+  # End of content
+  return undef unless length $chunk;
 
-        # End of content
-        last unless length $chunk;
-
-        # Content
-        $offset += length $chunk;
-        $self->_offset($offset);
-        return $chunk;
-    }
-
-    return;
+  # Content
+  $self->{offset} += length $chunk;
+  return $chunk;
 }
 
 1;
-__END__
 
 =head1 NAME
 
-Mojo::Server::PSGI - PSGI Server
+Mojo::Server::PSGI - PSGI server
 
 =head1 SYNOPSIS
 
-    # myapp.psgi
-    use Mojo::Server::PSGI;
-    my $psgi = Mojo::Server::PSGI->new(app_class => 'MyApp');
-    my $app  = sub { $psgi->run(@_) };
+  use Mojo::Server::PSGI;
+
+  my $psgi = Mojo::Server::PSGI->new;
+  $psgi->unsubscribe('request');
+  $psgi->on(request => sub {
+    my ($psgi, $tx) = @_;
+
+    # Request
+    my $method = $tx->req->method;
+    my $path   = $tx->req->url->path;
+
+    # Response
+    $tx->res->code(200);
+    $tx->res->headers->content_type('text/plain');
+    $tx->res->body("$method request for $path!");
+
+    # Resume transaction
+    $tx->resume;
+  });
+  my $app = $psgi->to_psgi_app;
 
 =head1 DESCRIPTION
 
 L<Mojo::Server::PSGI> allows L<Mojo> applications to run on all PSGI
 compatible servers.
 
+See L<Mojolicious::Guides::Cookbook> for more.
+
+=head1 EVENTS
+
+L<Mojo::Server::PSGI> inherits all events from L<Mojo::Server>.
+
 =head1 METHODS
 
-L<Mojo::Server::PSGI> inherits all methods from L<Mojo::Server> and
-implements the following new ones.
+L<Mojo::Server::PSGI> inherits all methods from L<Mojo::Server> and implements
+the following new ones.
 
-=head2 C<run>
+=head2 run
 
-    my $res = $psgi->run($env);
+  my $res = $psgi->run($env);
 
-Start PSGI.
+Run L<PSGI>.
+
+=head2 to_psgi_app
+
+  my $app = $psgi->to_psgi_app;
+
+Turn L<Mojo> application into L<PSGI> application.
 
 =head1 SEE ALSO
 
-L<Mojolicious>, L<Mojolicious::Guides>, L<http://mojolicious.org>.
+L<Mojolicious>, L<Mojolicious::Guides>, L<http://mojolicio.us>.
 
 =cut

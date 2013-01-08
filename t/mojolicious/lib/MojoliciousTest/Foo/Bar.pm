@@ -1,11 +1,8 @@
 package MojoliciousTest::Foo::Bar;
+use Mojolicious::Controller -base;
 
-use strict;
-use warnings;
-
-use base 'Mojolicious::Controller';
-
-# Poor Bender. Without his brain he's become all quiet and helpful.
 sub index {1}
+
+sub test { shift->stash(message => 'works') }
 
 1;

@@ -1,58 +1,52 @@
 package Mojo::Asset::Memory;
+use Mojo::Base 'Mojo::Asset';
 
-use strict;
-use warnings;
+use Mojo::Asset::File;
+use Mojo::Util 'spurt';
 
-use base 'Mojo::Asset';
+has 'auto_upgrade';
+has max_memory_size => sub { $ENV{MOJO_MAX_MEMORY_SIZE} || 262144 };
 
-use Carp 'croak';
-use IO::File;
-
-# There's your giraffe, little girl.
-# I'm a boy.
-# That's the spirit. Never give up.
-sub new {
-    my $self = shift->SUPER::new(@_);
-    $self->{content} = '';
-    return $self;
-}
+sub new { shift->SUPER::new(@_, content => '') }
 
 sub add_chunk {
-    my ($self, $chunk) = @_;
-    utf8::encode $chunk if utf8::is_utf8 $chunk;
-    $self->{content} .= $chunk;
-    return $self;
+  my ($self, $chunk) = @_;
+
+  # Upgrade if necessary
+  $self->{content} .= $chunk // '';
+  return $self
+    if !$self->auto_upgrade || $self->size <= $self->max_memory_size;
+  my $file = Mojo::Asset::File->new;
+  return $file->add_chunk($self->emit(upgrade => $file)->slurp);
 }
 
 sub contains {
-    my $self  = shift;
-    my $start = $self->start_range;
-    my $pos   = index $self->{content}, shift, $start;
-    $pos -= $start if $start && $pos >= 0;
-    my $end = $self->end_range;
-    return -1 if $end && $pos >= $end;
-    return $pos;
+  my ($self, $string) = @_;
+
+  my $start = $self->start_range;
+  my $pos = index $self->{content}, $string, $start;
+  $pos -= $start if $start && $pos >= 0;
+  my $end = $self->end_range;
+
+  return $end && ($pos + length $string) >= $end ? -1 : $pos;
 }
 
 sub get_chunk {
-    my ($self, $start) = @_;
-    $start += $self->start_range;
-    my $length = $ENV{MOJO_CHUNK_SIZE} || 262144;
-    if (my $end = $self->end_range) {
-        $length = $end + 1 - $start if ($start + $length) > $end;
-    }
-    substr shift->{content}, $start, $length;
+  my ($self, $start) = @_;
+
+  $start += $self->start_range;
+  my $size = 131072;
+  if (my $end = $self->end_range) {
+    $size = $end + 1 - $start if ($start + $size) > $end;
+  }
+
+  return substr shift->{content}, $start, $size;
 }
 
 sub move_to {
-    my ($self, $path) = @_;
-
-    # Write
-    my $file = IO::File->new;
-    $file->open("> $path") or croak qq/Can't open file "$path": $!/;
-    $file->syswrite($self->{content});
-
-    return $self;
+  my ($self, $to) = @_;
+  spurt $self->{content}, $to;
+  return $self;
 }
 
 sub size { length shift->{content} }
@@ -60,73 +54,114 @@ sub size { length shift->{content} }
 sub slurp { shift->{content} }
 
 1;
-__END__
 
 =head1 NAME
 
-Mojo::Asset::Memory - In-Memory Asset
+Mojo::Asset::Memory - In-memory storage for HTTP content
 
 =head1 SYNOPSIS
 
-    use Mojo::Asset::Memory;
+  use Mojo::Asset::Memory;
 
-    my $asset = Mojo::Asset::Memory->new;
-    $asset->add_chunk('foo bar baz');
-    print $asset->slurp;
+  my $mem = Mojo::Asset::Memory->new;
+  $mem->add_chunk('foo bar baz');
+  say $mem->slurp;
 
 =head1 DESCRIPTION
 
-L<Mojo::Asset::Memory> is a container for in-memory assets.
+L<Mojo::Asset::Memory> is an in-memory storage backend for HTTP content.
+
+=head1 EVENTS
+
+L<Mojo::Asset::Memory> inherits all events from L<Mojo::Asset> and can emit
+the following new ones.
+
+=head2 upgrade
+
+  $mem->on(upgrade => sub {
+    my ($mem, $file) = @_;
+    ...
+  });
+
+Emitted when asset gets upgraded to a L<Mojo::Asset::File> object.
+
+  $mem->on(upgrade => sub {
+    my ($mem, $file) = @_;
+    $file->tmpdir('/tmp');
+  });
+
+=head1 ATTRIBUTES
+
+L<Mojo::Asset::Memory> inherits all attributes from L<Mojo::Asset> and
+implements the following new ones.
+
+=head2 auto_upgrade
+
+  my $upgrade = $mem->auto_upgrade;
+  $mem        = $mem->auto_upgrade(1);
+
+Try to detect if content size exceeds C<max_memory_size> limit and
+automatically upgrade to a L<Mojo::Asset::File> object.
+
+=head2 max_memory_size
+
+  my $size = $mem->max_memory_size;
+  $mem     = $mem->max_memory_size(1024);
+
+Maximum size in bytes of data to keep in memory before automatically upgrading
+to a L<Mojo::Asset::File> object, defaults to the value of the
+C<MOJO_MAX_MEMORY_SIZE> environment variable or C<262144>.
 
 =head1 METHODS
 
-L<Mojo::Asset::Memory> inherits all methods from L<Mojo::Asset> and
-implements the following new ones.
+L<Mojo::Asset::Memory> inherits all methods from L<Mojo::Asset> and implements
+the following new ones.
 
-=head2 C<new>
+=head2 new
 
-    my $asset = Mojo::Asset::Memory->new;
+  my $mem = Mojo::Asset::Memory->new;
 
 Construct a new L<Mojo::Asset::Memory> object.
 
-=head2 C<add_chunk>
+=head2 add_chunk
 
-    $asset = $asset->add_chunk('foo bar baz');
+  $mem     = $mem->add_chunk('foo bar baz');
+  my $file = $mem->add_chunk('abc' x 262144);
 
-Add chunk of data to asset.
+Add chunk of data and upgrade to L<Mojo::Asset::File> object if necessary.
 
-=head2 C<contains>
+=head2 contains
 
-    my $position = $asset->contains('bar');
+  my $position = $mem->contains('bar');
 
 Check if asset contains a specific string.
 
-=head2 C<get_chunk>
+=head2 get_chunk
 
-    my $chunk = $asset->get_chunk($offset);
+  my $chunk = $mem->get_chunk($offset);
 
 Get chunk of data starting from a specific position.
 
-=head2 C<move_to>
+=head2 move_to
 
-    $asset = $asset->move_to('/foo/bar/baz.txt');
+  $mem = $mem->move_to('/home/sri/foo.txt');
 
 Move asset data into a specific file.
 
-=head2 C<size>
+=head2 size
 
-    my $size = $asset->size;
+  my $size = $mem->size;
 
 Size of asset data in bytes.
 
-=head2 C<slurp>
+=head2 slurp
 
-    my $string = $file->slurp;
+  my $string = mem->slurp;
 
 Read all asset data at once.
 
 =head1 SEE ALSO
 
-L<Mojolicious>, L<Mojolicious::Guides>, L<http://mojolicious.org>.
+L<Mojolicious>, L<Mojolicious::Guides>, L<http://mojolicio.us>.
 
 =cut

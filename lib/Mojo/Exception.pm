@@ -1,174 +1,134 @@
 package Mojo::Exception;
+use Mojo::Base -base;
+use overload
+  'bool'   => sub {1},
+  '""'     => sub { shift->to_string },
+  fallback => 1;
 
-use strict;
-use warnings;
+use Scalar::Util 'blessed';
 
-use base 'Mojo::Base';
-use overload '""' => sub { shift->to_string }, fallback => 1;
+has [qw(frames line lines_before lines_after)] => sub { [] };
+has message => 'Exception!';
+has verbose => sub { $ENV{MOJO_EXCEPTION_VERBOSE} || 0 };
 
-use IO::File;
-
-__PACKAGE__->attr([qw/line lines_before lines_after/] => sub { [] });
-__PACKAGE__->attr([qw/message raw_message/] => 'Exception!');
-__PACKAGE__->attr(verbose => sub { $ENV{MOJO_EXCEPTION_VERBOSE} || 0 });
-
-# Attempted murder? Now honestly, what is that?
-# Do they give a Nobel Prize for attempted chemistry?
 sub new {
-    my $self = shift->SUPER::new();
-
-    # Message
-    $self->message(shift);
-    my $message = $self->message;
-    $self->raw_message($message);
-
-    # Trace name and line
-    my @trace;
-    while ($message =~ /at\s+(.+)\s+line\s+(\d+)/g) {
-        push @trace, {file => $1, line => $2};
-    }
-
-    # Frames
-    foreach my $frame (reverse @trace) {
-
-        # Frame
-        my $file = $frame->{file};
-        my $line = $frame->{line};
-
-        # Readable
-        if (-r $file) {
-
-            # Slurp
-            my $handle = IO::File->new("< $file");
-            my @lines  = <$handle>;
-
-            # Line
-            $self->_parse_context(\@lines, $line);
-
-            # Done
-            last;
-        }
-    }
-
-    # Parse specific file
-    return $self unless my $lines = shift;
-    my @lines = split /\n/, $lines;
-
-    # Cleanup plain messages
-    unless (ref $message) {
-        my $filter = sub {
-            my $num  = shift;
-            my $new  = "template line $num";
-            my $line = $lines[$num];
-            $new .= qq/, near "$line"/ if defined $line;
-            $new .= '.';
-            return $new;
-        };
-        $message =~ s/\(eval\s+\d+\) line (\d+).*/$filter->($1)/ge;
-        $self->message($message);
-    }
-
-    # Parse message
-    my $line;
-    $line = $1 if $self->message =~ /at\s+template\s+line\s+(\d+)/;
-
-    # Context
-    $self->_parse_context(\@lines, $line) if $line;
-
-    return $self;
+  my $self = shift->SUPER::new;
+  return @_ ? $self->_detect(@_) : $self;
 }
 
-# You killed zombie Flanders!
-# He was a zombie?
+sub throw { die shift->new->trace(2)->_detect(@_) }
+
 sub to_string {
-    my $self = shift;
+  my $self = shift;
 
-    # Verbose
-    return $self->message unless $self->verbose;
+  # Message
+  return $self->message unless $self->verbose;
+  my $string = $self->message ? $self->message : '';
 
-    my $string = '';
+  # Before
+  $string .= $_->[0] . ': ' . $_->[1] . "\n" for @{$self->lines_before};
 
-    # Message
-    $string .= $self->message if $self->message;
+  # Line
+  $string .= ($self->line->[0] . ': ' . $self->line->[1] . "\n")
+    if $self->line->[0];
 
-    # Before
-    for my $line (@{$self->lines_before}) {
-        $string .= $line->[0] . ': ' . $line->[1] . "\n";
-    }
+  # After
+  $string .= $_->[0] . ': ' . $_->[1] . "\n" for @{$self->lines_after};
 
-    # Line
-    $string .= ($self->line->[0] . ': ' . $self->line->[1] . "\n")
-      if $self->line->[0];
-
-    # After
-    for my $line (@{$self->lines_after}) {
-        $string .= $line->[0] . ': ' . $line->[1] . "\n";
-    }
-
-    return $string;
+  return $string;
 }
 
-sub _parse_context {
-    my ($self, $lines, $line) = @_;
+sub trace {
+  my ($self, $start) = @_;
+  $start //= 1;
+  my @frames;
+  while (my @trace = caller($start++)) { push @frames, \@trace }
+  return $self->frames(\@frames);
+}
 
-    # Wrong file
-    return unless defined $lines->[$line - 1];
+sub _context {
+  my ($self, $line, $lines) = @_;
 
-    # Context
-    my $code = $lines->[$line - 1];
-    chomp $code;
-    $self->line([$line, $code]);
+  # Wrong file
+  return unless defined $lines->[0][$line - 1];
 
-    # Cleanup
-    $self->lines_before([]);
-    $self->lines_after([]);
+  # Line
+  $self->line([$line]);
+  for my $l (@$lines) {
+    chomp(my $code = $l->[$line - 1]);
+    push @{$self->line}, $code;
+  }
 
-    # -2
-    my $previous_line = $line - 3;
-    $code = $previous_line >= 0 ? $lines->[$previous_line] : undef;
-    if (defined $code) {
-        chomp $code;
-        push @{$self->lines_before}, [$line - 2, $code];
+  # Before
+  for my $i (2 .. 6) {
+    last if ((my $previous = $line - $i) < 0);
+    if (defined $lines->[0][$previous]) {
+      unshift @{$self->lines_before}, [$previous + 1];
+      for my $l (@$lines) {
+        chomp(my $code = $l->[$previous]);
+        push @{$self->lines_before->[0]}, $code;
+      }
     }
+  }
 
-    # -1
-    $previous_line = $line - 2;
-    $code = $previous_line >= 0 ? $lines->[$previous_line] : undef;
-    if (defined $code) {
+  # After
+  for my $i (0 .. 4) {
+    next if ((my $next = $line + $i) < 0);
+    if (defined $lines->[0][$next]) {
+      push @{$self->lines_after}, [$next + 1];
+      for my $l (@$lines) {
+        next unless defined(my $code = $l->[$next]);
         chomp $code;
-        push @{$self->lines_before}, [$line - 1, $code];
+        push @{$self->lines_after->[-1]}, $code;
+      }
     }
+  }
+}
 
-    # +1
-    my $next_line = $line;
-    $code = $next_line >= 0 ? $lines->[$next_line] : undef;
-    if (defined $code) {
-        chomp $code;
-        push @{$self->lines_after}, [$line + 1, $code];
-    }
+sub _detect {
+  my ($self, $msg, $files) = @_;
 
-    # +2
-    $next_line = $line + 1;
-    $code = $next_line >= 0 ? $lines->[$next_line] : undef;
-    if (defined $code) {
-        chomp $code;
-        push @{$self->lines_after}, [$line + 2, $code];
-    }
+  # Message
+  return $msg if blessed $msg && $msg->isa('Mojo::Exception');
+  $self->message($msg);
 
+  # Extract file and line from message
+  my @trace;
+  while ($msg =~ /at\s+(.+?)\s+line\s+(\d+)/g) { unshift @trace, [$1, $2] }
+
+  # Extract file and line from stacktrace
+  my $first = $self->frames->[0];
+  unshift @trace, [$first->[1], $first->[2]] if $first;
+
+  # Search for context in files
+  for my $frame (@trace) {
+    next unless -r $frame->[0];
+    open my $handle, '<:utf8', $frame->[0];
+    $self->_context($frame->[1], [[<$handle>]]);
     return $self;
+  }
+
+  # More context
+  $self->_context($trace[0][1], [map { [split /\n/] } @$files]) if $files;
+
+  return $self;
 }
 
 1;
-__END__
 
 =head1 NAME
 
-Mojo::Exception - Exceptions With Context
+Mojo::Exception - Exceptions with context
 
 =head1 SYNOPSIS
 
-    use Mojo::Exception;
-    my $e = Mojo::Exception->new;
+  use Mojo::Exception;
+
+  # Throw exception
+  Mojo::Exception->throw('Not again!');
+
+  # Customize exception
+  die Mojo::Exception->new('Not again!')->trace(2)->verbose(1);
 
 =head1 DESCRIPTION
 
@@ -178,69 +138,84 @@ L<Mojo::Exception> is a container for exceptions with context information.
 
 L<Mojo::Exception> implements the following attributes.
 
-=head2 C<line>
+=head2 frames
 
-    my $line = $e->line;
-    $e       = $e->line([3, 'foo']);
+  my $frames = $e->frames;
+  $e         = $e->frames($frames);
+
+Stacktrace.
+
+=head2 line
+
+  my $line = $e->line;
+  $e       = $e->line([3 => 'foo']);
 
 The line where the exception occured.
 
-=head2 C<lines_after>
+=head2 lines_after
 
-    my $lines = $e->lines_after;
-    $e        = $e->lines_after([[1, 'bar'], [2, 'baz']]);
+  my $lines = $e->lines_after;
+  $e        = $e->lines_after([[1 => 'bar'], [2 => 'baz']]);
 
 Lines after the line where the exception occured.
 
-=head2 C<lines_before>
+=head2 lines_before
 
-    my $lines = $e->lines_before;
-    $e        = $e->lines_before([[4, 'bar'], [5, 'baz']]);
+  my $lines = $e->lines_before;
+  $e        = $e->lines_before([[4 => 'bar'], [5 => 'baz']]);
 
 Lines before the line where the exception occured.
 
-=head2 C<message>
+=head2 message
 
-    my $message = $e->message;
-    $e          = $e->message('Oops!');
+  my $msg = $e->message;
+  $e      = $e->message('Oops!');
 
 Exception message.
 
-=head2 C<raw_message>
+=head2 verbose
 
-    my $message = $e->raw_message;
-    $e          = $e->raw_message('Oops!');
+  my $verbose = $e->verbose;
+  $e          = $e->verbose(1);
 
-Raw unprocessed exception message.
-
-=head2 C<verbose>
-
-    my $verbose = $e->verbose;
-    $e          = $e->verbose(1);
-
-Activate verbose rendering.
+Activate verbose rendering, defaults to the value of the
+C<MOJO_EXCEPTION_VERBOSE> environment variable or C<0>.
 
 =head1 METHODS
 
 L<Mojo::Exception> inherits all methods from L<Mojo::Base> and implements the
 following new ones.
 
-=head2 C<new>
+=head2 new
 
-    my $e = Mojo::Exception->new('Oops!');
-    my $e = Mojo::Exception->new('Oops!', $file);
+  my $e = Mojo::Exception->new('Oops!');
+  my $e = Mojo::Exception->new('Oops!', $files);
 
 Construct a new L<Mojo::Exception> object.
 
-=head2 C<to_string>
+=head2 throw
 
-    my $string = $e->to_string;
-    my $string = "$e";
+  Mojo::Exception->throw('Oops!');
+  Mojo::Exception->throw('Oops!', $files);
 
-Render exception with context.
+Throw exception with stacktrace.
+
+=head2 to_string
+
+  my $string = $e->to_string;
+  my $string = "$e";
+
+Render exception.
+
+=head2 trace
+
+  $e = $e->trace;
+  $e = $e->trace(2);
+
+Store stacktrace.
 
 =head1 SEE ALSO
 
-L<Mojolicious>, L<Mojolicious::Guides>, L<http://mojolicious.org>.
+L<Mojolicious>, L<Mojolicious::Guides>, L<http://mojolicio.us>.
 
 =cut

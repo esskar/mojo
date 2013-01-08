@@ -1,175 +1,234 @@
-#!/usr/bin/env perl
+use Mojo::Base -strict;
 
-use strict;
-use warnings;
+# Disable IPv6 and libev
+BEGIN {
+  $ENV{MOJO_NO_IPV6} = 1;
+  $ENV{MOJO_REACTOR} = 'Mojo::Reactor::Poll';
+}
 
-# Disable epoll, kqueue and IPv6
-BEGIN { $ENV{MOJO_POLL} = $ENV{MOJO_NO_IPV6} = 1 }
-
-use Mojo::IOLoop;
 use Test::More;
+use Mojo;
+use Mojo::IOLoop;
+use Mojo::Log;
+use Mojo::Server::Daemon;
+use Mojo::UserAgent;
+use Mojolicious;
 
-# Make sure sockets are working
-plan skip_all => 'working sockets required for this test!'
-  unless Mojo::IOLoop->new->generate_port;
-plan tests => 39;
+# Timeout
+{
+  is(Mojo::Server::Daemon->new->inactivity_timeout, 15, 'right value');
+  local $ENV{MOJO_INACTIVITY_TIMEOUT} = 25;
+  is(Mojo::Server::Daemon->new->inactivity_timeout, 25, 'right value');
+  $ENV{MOJO_INACTIVITY_TIMEOUT} = 0;
+  is(Mojo::Server::Daemon->new->inactivity_timeout, 0, 'right value');
+}
 
-# I was so bored I cut the pony tail off the guy in front of us.
-# Look at me, I'm a grad student. I'm 30 years old and I made $600 last year.
-# Bart, don't make fun of grad students.
-# They've just made a terrible life choice.
-use_ok('Mojo');
-use_ok('Mojo::Client');
-use_ok('Mojo::Transaction::HTTP');
-use_ok('Mojo::HelloWorld');
+# Listen
+{
+  is_deeply(Mojo::Server::Daemon->new->listen,
+    ['http://*:3000'], 'right value');
+  local $ENV{MOJO_LISTEN} = 'http://localhost:8080';
+  is_deeply(Mojo::Server::Daemon->new->listen,
+    ['http://localhost:8080'], 'right value');
+  $ENV{MOJO_LISTEN} = 'http://*:80,https://*:443';
+  is_deeply(
+    Mojo::Server::Daemon->new->listen,
+    ['http://*:80', 'https://*:443'],
+    'right value'
+  );
+}
 
 # Logger
 my $logger = Mojo::Log->new;
 my $app = Mojo->new({log => $logger});
-is($app->log, $logger, 'right logger');
+is $app->log, $logger, 'right logger';
 
-$app = Mojo::HelloWorld->new;
-my $client = Mojo::Client->new->app($app);
+# Config
+is $app->config('foo'), undef, 'no value';
+is_deeply $app->config(foo => 'bar')->config, {foo => 'bar'}, 'right value';
+is $app->config('foo'), 'bar', 'right value';
+delete $app->config->{foo};
+is $app->config('foo'), undef, 'no value';
+$app->config(foo => 'bar', baz => 'yada');
+is_deeply $app->config, {foo => 'bar', baz => 'yada'}, 'right value';
+$app->config({test => 23});
+is $app->config->{test}, 23, 'right value';
 
-# Continue
-my $port   = $client->test_server;
-my $buffer = '';
-$client->ioloop->connect(
-    address    => 'localhost',
-    port       => $port,
-    connect_cb => sub {
-        my ($self, $id, $chunk) = @_;
-        $self->write($id,
-                "GET /1/ HTTP/1.1\x0d\x0a"
-              . "Expect: 100-continue\x0d\x0a"
-              . "Content-Length: 4\x0d\x0a\x0d\x0a");
-    },
-    read_cb => sub {
-        my ($self, $id, $chunk) = @_;
-        $buffer .= $chunk;
-        $self->drop($id) and $self->stop if $buffer =~ /Mojo is working!/;
-        $self->write($id, '4321')
-          if $buffer =~ /HTTP\/1.1 100 Continue.*\x0d\x0a\x0d\x0a/gs;
-    }
+# Transaction
+isa_ok $app->build_tx, 'Mojo::Transaction::HTTP', 'right class';
+
+# Fresh application
+$app = Mojolicious->new;
+my $ua = Mojo::UserAgent->new(ioloop => Mojo::IOLoop->singleton)->app($app);
+is $ua->app->moniker, 'mojolicious', 'right moniker';
+
+# Silence
+$app->log->level('fatal');
+
+# POST /chunked
+$app->routes->post(
+  '/chunked' => sub {
+    my $self = shift;
+
+    my $params = $self->req->params->to_hash;
+    my @chunks;
+    for my $key (sort keys %$params) { push @chunks, $params->{$key} }
+
+    my $cb;
+    $cb = sub {
+      my $self = shift;
+      $cb = undef unless my $chunk = shift @chunks || '';
+      $self->write_chunk($chunk, $cb);
+    };
+    $self->$cb;
+  }
 );
-$client->ioloop->start;
-like($buffer, qr/HTTP\/1.1 100 Continue/, 'request was continued');
 
-# Pipelined
-$buffer = '';
-$client->ioloop->connect(
-    address    => 'localhost',
-    port       => $port,
-    connect_cb => sub {
-        my ($self, $id) = @_;
-        $self->write($id,
-                "GET /2/ HTTP/1.1\x0d\x0a"
-              . "Content-Length: 0\x0d\x0a\x0d\x0a"
-              . "GET /3/ HTTP/1.1\x0d\x0a"
-              . "Content-Length: 0\x0d\x0a\x0d\x0a");
-    },
-    read_cb => sub {
-        my ($self, $id, $chunk) = @_;
-        $buffer .= $chunk;
-        $self->drop($id) and $self->stop if $buffer =~ /Mojo.*Mojo/gs;
-    }
+# POST /upload
+my ($local_address, $local_port, $remote_address, $remote_port);
+$app->routes->post(
+  '/upload' => sub {
+    my $self = shift;
+    $local_address  = $self->tx->local_address;
+    $local_port     = $self->tx->local_port;
+    $remote_address = $self->tx->remote_address;
+    $remote_port    = $self->tx->remote_port;
+    $self->render_data($self->req->upload('file')->slurp);
+  }
 );
-$client->ioloop->start;
-like($buffer, qr/Mojo/, 'transactions were pipelined');
+
+# /*
+$app->routes->any('/*whatever' => {text => 'Whatever!'});
 
 # Normal request
-my $tx = Mojo::Transaction::HTTP->new;
-$tx->req->method('GET');
-$tx->req->url->parse('/5/');
-$client->process($tx);
-ok($tx->keep_alive, 'will be kept alive');
-is($tx->res->code, 200, 'right status');
-like($tx->res->body, qr/Mojo/, 'right content');
+my $tx = $ua->get('/normal/');
+ok $tx->keep_alive, 'will be kept alive';
+is $tx->res->code, 200,         'right status';
+is $tx->res->body, 'Whatever!', 'right content';
 
 # Keep alive request
-$tx = Mojo::Transaction::HTTP->new;
-$tx->req->method('GET');
-$tx->req->url->parse('/6/');
-$client->process($tx);
-ok($tx->keep_alive, 'will be kept alive');
-ok($tx->kept_alive, 'was kept alive');
-is($tx->res->code, 200, 'right status');
-like($tx->res->body, qr/Mojo/, 'right content');
+$tx = $ua->get('/normal/');
+ok $tx->keep_alive, 'will be kept alive';
+ok $tx->kept_alive, 'was kept alive';
+is $tx->res->code, 200,         'right status';
+is $tx->res->body, 'Whatever!', 'right content';
 
 # Non keep alive request
-$tx = Mojo::Transaction::HTTP->new;
-$tx->req->method('GET');
-$tx->req->url->parse('/7/');
-$tx->req->headers->connection('close');
-$client->process($tx);
-ok(!$tx->keep_alive, 'will not be kept alive');
-ok($tx->kept_alive,  'was kept alive');
-is($tx->res->code,                200,     'right status');
-is($tx->res->headers->connection, 'Close', 'right "Connection" value');
-like($tx->res->body, qr/Mojo/, 'right content');
+$tx = $ua->get('/close/' => {Connection => 'close'});
+ok !$tx->keep_alive, 'will not be kept alive';
+ok $tx->kept_alive, 'was kept alive';
+is $tx->res->code, 200, 'right status';
+is $tx->res->headers->connection, 'close', 'right "Connection" value';
+is $tx->res->body, 'Whatever!', 'right content';
 
 # Second non keep alive request
-$tx = Mojo::Transaction::HTTP->new;
-$tx->req->method('GET');
-$tx->req->url->parse('/8/');
-$tx->req->headers->connection('close');
-$client->process($tx);
-ok(!$tx->keep_alive, 'will not be kept alive');
-ok(!$tx->kept_alive, 'was not kept alive');
-is($tx->res->code,                200,     'right status');
-is($tx->res->headers->connection, 'Close', 'right "Connection" value');
-like($tx->res->body, qr/Mojo/, 'right content');
+$tx = $ua->get('/close/' => {Connection => 'close'});
+ok !$tx->keep_alive, 'will not be kept alive';
+ok !$tx->kept_alive, 'was not kept alive';
+is $tx->res->code, 200, 'right status';
+is $tx->res->headers->connection, 'close', 'right "Connection" value';
+is $tx->res->body, 'Whatever!', 'right content';
 
 # POST request
-$tx = Mojo::Transaction::HTTP->new;
-$tx->req->method('POST');
-$tx->req->url->parse('/9/');
-$tx->req->headers->expect('fun');
-$tx->req->body('foo bar baz' x 128);
-$client->process($tx);
-is($tx->res->code, 200, 'right status');
-like($tx->res->body, qr/Mojo/, 'right content');
+$tx = $ua->post('/fun/' => {Expect => 'fun'} => 'foo bar baz' x 128);
+ok defined $tx->connection, 'has connection id';
+is $tx->res->code, 200,         'right status';
+is $tx->res->body, 'Whatever!', 'right content';
 
-# POST request
-$tx = Mojo::Transaction::HTTP->new;
-$tx->req->method('POST');
-$tx->req->url->parse('/10/');
-$tx->req->headers->expect('fun');
-$tx->req->body('bar baz foo' x 128);
-$client->process($tx);
-ok(defined $tx->connection, 'has connection id');
-is($tx->res->code, 200, 'right status');
-like($tx->res->body, qr/Mojo/, 'right content');
+# Parallel requests
+my $delay = Mojo::IOLoop->delay;
+$ua->get('/parallel1/' => $delay->begin);
+$ua->post(
+  '/parallel2/' => {Expect => 'fun'} => 'bar baz foo' x 128 => $delay->begin);
+$ua->get('/parallel3/' => $delay->begin);
+($tx, my $tx2, my $tx3) = $delay->wait;
+ok $tx->is_finished, 'transaction is finished';
+is $tx->res->body, 'Whatever!', 'right content';
+ok !$tx->error, 'no error';
+ok $tx2->is_finished, 'transaction is finished';
+is $tx2->res->body, 'Whatever!', 'right content';
+ok !$tx2->error, 'no error';
+ok $tx3->is_finished, 'transaction is finished';
+is $tx3->res->body, 'Whatever!', 'right content';
+ok !$tx3->error, 'no error';
 
-# Multiple requests
-$tx = Mojo::Transaction::HTTP->new;
-$tx->req->method('GET');
-$tx->req->url->parse('/11/');
-my $tx2 = Mojo::Transaction::HTTP->new;
-$tx2->req->method('GET');
-$tx2->req->url->parse('/12/');
-$client->process($tx, $tx2);
-ok(defined $tx->connection,  'has connection id');
-ok(defined $tx2->connection, 'has connection id');
-ok($tx->is_done,             'transaction is done');
-ok($tx2->is_done,            'transaction is done');
+# Form with chunked response
+my %params;
+for my $i (1 .. 10) { $params{"test$i"} = $i }
+my $result = '';
+for my $key (sort keys %params) { $result .= $params{$key} }
+my ($code, $body);
+my $port = $ua->app_url->port;
+$tx = $ua->post_form("http://127.0.0.1:$port/chunked" => \%params);
+is $tx->res->code, 200, 'right status';
+is $tx->res->body, $result, 'right content';
 
-# Multiple requests
-$tx = Mojo::Transaction::HTTP->new;
-$tx->req->method('GET');
-$tx->req->url->parse('/13/');
-$tx2 = Mojo::Transaction::HTTP->new;
-$tx2->req->method('POST');
-$tx2->req->url->parse('/14/');
-$tx2->req->headers->expect('fun');
-$tx2->req->body('bar baz foo' x 128);
-my $tx3 = Mojo::Transaction::HTTP->new;
-$tx3->req->method('GET');
-$tx3->req->url->parse('/15/');
-$client->process($tx, $tx2, $tx3);
-ok($tx->is_done,  'transaction is done');
-ok(!$tx->error,   'has no errors');
-ok($tx2->is_done, 'transaction is done');
-ok(!$tx2->error,  'has no error');
-ok($tx3->is_done, 'transaction is done');
-ok(!$tx3->error,  'has no error');
+# Upload
+($code, $body) = ();
+$tx = $ua->post_form(
+  "http://127.0.0.1:$port/upload" => {file => {content => $result}});
+is $tx->res->code, 200, 'right status';
+is $tx->res->body, $result, 'right content';
+ok $tx->local_address, 'has local address';
+ok $tx->local_port > 0, 'has local port';
+ok $tx->remote_address, 'has local address';
+ok $tx->remote_port > 0, 'has local port';
+ok $local_address, 'has local address';
+ok $local_port > 0, 'has local port';
+ok $remote_address, 'has local address';
+ok $remote_port > 0, 'has local port';
+
+# Pipelined
+$port = Mojo::IOLoop->generate_port;
+my $daemon = Mojo::Server::Daemon->new(listen => ["http://127.0.0.1:$port"],
+  silent => 1);
+$daemon->start;
+is $daemon->app->moniker, 'HelloWorld', 'right moniker';
+my $buffer = '';
+my $id;
+$id = Mojo::IOLoop->client(
+  {port => $port} => sub {
+    my ($loop, $err, $stream) = @_;
+    $stream->on(
+      read => sub {
+        my ($stream, $chunk) = @_;
+        $buffer .= $chunk;
+        Mojo::IOLoop->remove($id) and Mojo::IOLoop->stop
+          if $buffer =~ s/ is working!.*is working!$//gs;
+      }
+    );
+    $stream->write("GET /pipeline1/ HTTP/1.1\x0d\x0a"
+        . "Content-Length: 0\x0d\x0a\x0d\x0a"
+        . "GET /pipeline2/ HTTP/1.1\x0d\x0a"
+        . "Content-Length: 0\x0d\x0a\x0d\x0a");
+  }
+);
+Mojo::IOLoop->start;
+like $buffer, qr/Mojo$/, 'transactions were pipelined';
+
+# Throttling
+$port   = Mojo::IOLoop->generate_port;
+$daemon = Mojo::Server::Daemon->new(
+  app    => $app,
+  listen => ["http://127.0.0.1:$port"],
+  silent => 1
+);
+$daemon->start;
+is $daemon->app->moniker, 'mojolicious', 'right moniker';
+$tx = $ua->get("http://127.0.0.1:$port/throttle1" => {Connection => 'close'});
+ok $tx->success, 'successful';
+is $tx->res->code, 200,         'right status';
+is $tx->res->body, 'Whatever!', 'right content';
+$daemon->stop;
+$tx = $ua->inactivity_timeout(0.5)
+  ->get("http://127.0.0.1:$port/throttle2" => {Connection => 'close'});
+ok !$tx->success, 'not successful';
+is $tx->error, 'Inactivity timeout', 'right error';
+$daemon->start;
+$tx = $ua->inactivity_timeout(10)
+  ->get("http://127.0.0.1:$port/throttle3" => {Connection => 'close'});
+ok $tx->success, 'successful';
+is $tx->res->code, 200,         'right status';
+is $tx->res->body, 'Whatever!', 'right content';
+
+done_testing();

@@ -1,128 +1,112 @@
 package Mojo::Path;
+use Mojo::Base -base;
+use overload
+  'bool'   => sub {1},
+  '""'     => sub { shift->to_string },
+  fallback => 1;
 
-use strict;
-use warnings;
+use Mojo::Util qw(decode encode url_escape url_unescape);
 
-use base 'Mojo::Base';
-use overload '""' => sub { shift->to_string }, fallback => 1;
+has charset => 'UTF-8';
+has [qw(leading_slash trailing_slash)];
+has parts => sub { [] };
 
-use Mojo::ByteStream 'b';
-use Mojo::URL;
-
-__PACKAGE__->attr([qw/leading_slash trailing_slash/] => 0);
-__PACKAGE__->attr(parts => sub { [] });
-
-sub new {
-    my $self = shift->SUPER::new();
-    $self->parse(@_);
-    return $self;
-}
-
-sub append {
-    my $self = shift;
-
-    for (@_) {
-        my $value = "$_";
-
-        # *( pchar / "/" / "?" )
-        $value = b($value)->url_escape($Mojo::URL::PCHAR)->to_string;
-
-        push @{$self->parts}, $value;
-    }
-    return $self;
-}
+sub new { shift->SUPER::new->parse(@_) }
 
 sub canonicalize {
-    my $self = shift;
+  my $self = shift;
 
-    # Resolve path
-    my @path;
-    for my $part (@{$self->parts}) {
+  # Resolve path
+  my @parts;
+  for my $part (@{$self->parts}) {
 
-        # ".."
-        if ($part eq '..') {
-
-            # Leading '..' can't be resolved
-            unless (@path && $path[-1] ne '..') { push @path, '..' }
-
-            # Uplevel
-            else { pop @path }
-            next;
-        }
-
-        # "."
-        next if $part eq '.';
-
-        # Part
-        push @path, $part;
+    # ".."
+    if ($part eq '..') {
+      unless (@parts && $parts[-1] ne '..') { push @parts, '..' }
+      else                                  { pop @parts }
+      next;
     }
-    $self->parts(\@path);
 
-    return $self;
+    # "."
+    next if grep { $_ eq $part } '.', '';
+
+    # Part
+    push @parts, $part;
+  }
+  $self->trailing_slash(undef) unless @parts;
+
+  return $self->parts(\@parts);
 }
 
-# Homer, the plant called.
-# They said if you don't show up tomorrow don't bother showing up on Monday.
-# Woo-hoo. Four-day weekend.
 sub clone {
-    my $self  = shift;
-    my $clone = Mojo::Path->new;
+  my $self  = shift;
+  my $clone = Mojo::Path->new;
+  $clone->leading_slash($self->leading_slash);
+  $clone->trailing_slash($self->trailing_slash);
+  return $clone->charset($self->charset)->parts([@{$self->parts}]);
+}
 
-    $clone->parts([@{$self->parts}]);
-    $clone->leading_slash($self->leading_slash);
-    $clone->trailing_slash($self->trailing_slash);
+sub contains {
+  my ($self, $path) = @_;
 
-    return $clone;
+  my $parts = $self->new($path)->parts;
+  for my $part (@{$self->parts}) {
+    return 1 unless defined(my $try = shift @$parts);
+    return undef unless $part eq $try;
+  }
+
+  return !@$parts;
+}
+
+sub merge {
+  my ($self, $path) = @_;
+
+  # Replace
+  return $self->parse($path) if $path =~ m!^/!;
+
+  # Merge
+  pop @{$self->parts} unless $self->trailing_slash;
+  $path = $self->new($path);
+  push @{$self->parts}, @{$path->parts};
+  return $self->trailing_slash($path->trailing_slash);
 }
 
 sub parse {
-    my ($self, $path) = @_;
-    $path ||= '';
+  my ($self, $path) = @_;
 
-    # Meta
-    $self->leading_slash(1)  if $path =~ /^\//;
-    $self->trailing_slash(1) if $path =~ /\/$/;
+  $path = url_unescape $path // '';
+  my $charset = $self->charset;
+  $path = decode($charset, $path) // $path if $charset;
+  $self->leading_slash($path =~ s!^/!!  ? 1 : undef);
+  $self->trailing_slash($path =~ s!/$!! ? 1 : undef);
 
-    # Parse
-    my @parts;
-    for my $part (split '/', $path) {
+  return $self->parts([split '/', $path, -1]);
+}
 
-        # Empty parts before the first are garbage
-        next unless length $part or scalar @parts;
+sub to_abs_string { $_[0]->leading_slash ? "$_[0]" : "/$_[0]" }
 
-        # Empty parts behind the first are ok
-        $part = '' unless defined $part;
-
-        # Store
-        push @parts, b($part)->url_unescape($Mojo::URL::PCHAR)->to_string;
-    }
-
-    $self->parts(\@parts);
-
-    return $self;
+sub to_route {
+  my $self = shift;
+  return '/' . join('/', @{$self->parts}) . ($self->trailing_slash ? '/' : '');
 }
 
 sub to_string {
-    my $self = shift;
+  my $self = shift;
 
-    # Escape
-    my @path;
-    for my $part (@{$self->parts}) {
+  my @parts   = @{$self->parts};
+  my $charset = $self->charset;
+  @parts = map { encode $charset, $_ } @parts if $charset;
+  my $path = join '/',
+    map { url_escape $_, '^A-Za-z0-9\-._~!$&\'()*+,;=:@' } @parts;
+  $path = "/$path" if $self->leading_slash;
+  $path = "$path/" if $self->trailing_slash;
 
-        # *( pchar / "/" / "?" )
-        push @path, b($part)->url_escape($Mojo::URL::PCHAR)->to_string;
-    }
-
-    # Format
-    my $path = join '/', @path;
-    $path = "/$path" if $self->leading_slash;
-    $path = "$path/" if @path && $self->trailing_slash;
-
-    return $path;
+  return $path;
 }
 
 1;
-__END__
+
+=encoding utf8
 
 =head1 NAME
 
@@ -130,10 +114,11 @@ Mojo::Path - Path
 
 =head1 SYNOPSIS
 
-    use Mojo::Path;
+  use Mojo::Path;
 
-    my $path = Mojo::Path->new('/foo/bar%3B/baz.html');
-    print "$path";
+  my $path = Mojo::Path->new('/foo%2Fbar%3B/baz.html');
+  shift @{$path->parts};
+  say "$path";
 
 =head1 DESCRIPTION
 
@@ -143,24 +128,37 @@ L<Mojo::Path> is a container for URL paths.
 
 L<Mojo::Path> implements the following attributes.
 
-=head2 C<leading_slash>
+=head2 charset
 
-    my $leading_slash = $path->leading_slash;
-    $path             = $path->leading_slash(1);
+  my $charset = $path->charset;
+  $path       = $path->charset('UTF-8');
+
+Charset used for encoding and decoding, defaults to C<UTF-8>.
+
+  # Disable encoding and decoding
+  $path->charset(undef);
+
+=head2 leading_slash
+
+  my $leading_slash = $path->leading_slash;
+  $path             = $path->leading_slash(1);
 
 Path has a leading slash.
 
-=head2 C<parts>
+=head2 parts
 
-    my $parts = $path->parts;
-    $path     = $path->parts(qw/foo bar baz/);
+  my $parts = $path->parts;
+  $path     = $path->parts([qw(foo bar baz)]);
 
 The path parts.
 
-=head2 C<trailing_slash>
+  # Part with slash
+  push @{$path->parts}, 'foo/bar';
 
-    my $trailing_slash = $path->trailing_slash;
-    $path              = $path->trailing_slash(1);
+=head2 trailing_slash
+
+  my $trailing_slash = $path->trailing_slash;
+  $path              = $path->trailing_slash(1);
 
 Path has a trailing slash.
 
@@ -169,45 +167,97 @@ Path has a trailing slash.
 L<Mojo::Path> inherits all methods from L<Mojo::Base> and implements the
 following new ones.
 
-=head2 C<new>
+=head2 new
 
-    my $path = Mojo::Path->new;
-    my $path = Mojo::Path->new('/foo/bar%3B/baz.html');
+  my $path = Mojo::Path->new;
+  my $path = Mojo::Path->new('/foo%2Fbar%3B/baz.html');
 
 Construct a new L<Mojo::Path> object.
 
-=head2 C<append>
+=head2 canonicalize
 
-    $path = $path->append(qw/foo bar/);
-
-Append parts to path.
-
-=head2 C<canonicalize>
-
-    $path = $path->canonicalize;
+  $path = $path->canonicalize;
 
 Canonicalize path.
 
-=head2 C<clone>
+  # "/foo/baz"
+  Mojo::Path->new('/foo/bar/../baz')->canonicalize;
 
-    my $clone = $path->clone;
+=head2 clone
+
+  my $clone = $path->clone;
 
 Clone path.
 
-=head2 C<parse>
+=head2 contains
 
-    $path = $path->parse('/foo/bar%3B/baz.html');
+  my $success = $path->contains('/foo');
 
-Parse path.
+Check if path contains given prefix.
 
-=head2 C<to_string>
+  # True
+  Mojo::Path->new('/foo/bar')->contains('/');
+  Mojo::Path->new('/foo/bar')->contains('/foo');
+  Mojo::Path->new('/foo/bar')->contains('/foo/bar');
 
-    my $string = $path->to_string;
+  # False
+  Mojo::Path->new('/foo/bar')->contains('/f');
+  Mojo::Path->new('/foo/bar')->contains('/bar');
+  Mojo::Path->new('/foo/bar')->contains('/whatever');
+
+=head2 merge
+
+  $path = $path->merge('/foo/bar');
+  $path = $path->merge('foo/bar');
+  $path = $path->merge(Mojo::Path->new('foo/bar'));
+
+Merge paths.
+
+  # "/baz/yada"
+  Mojo::Path->new('/foo/bar')->merge('/baz/yada');
+
+  # "/foo/baz/yada"
+  Mojo::Path->new('/foo/bar')->merge('baz/yada');
+
+  # "/foo/bar/baz/yada"
+  Mojo::Path->new('/foo/bar/')->merge('baz/yada');
+
+=head2 parse
+
+  $path = $path->parse('/foo%2Fbar%3B/baz.html');
+
+Parse path. Note that C<%2F> will be treated as C</> for security reasons.
+
+=head2 to_abs_string
+
+  my $string = $path->to_abs_string;
+
+Turn path into an absolute string.
+
+  # "/i/%E2%99%A5/mojolicious"
+  Mojo::Path->new('i/%E2%99%A5/mojolicious')->to_abs_string;
+
+=head2 to_route
+
+  my $route = $path->to_route;
+
+Turn path into a route.
+
+  # "/i/♥/mojolicious"
+  Mojo::Path->new('i/%E2%99%A5/mojolicious')->to_route;
+
+=head2 to_string
+
+  my $string = $path->to_string;
+  my $string = "$path";
 
 Turn path into a string.
 
+  # "i/%E2%99%A5/mojolicious"
+  Mojo::Path->new('i/%E2%99%A5/mojolicious')->to_string;
+
 =head1 SEE ALSO
 
-L<Mojolicious>, L<Mojolicious::Guides>, L<http://mojolicious.org>.
+L<Mojolicious>, L<Mojolicious::Guides>, L<http://mojolicio.us>.
 
 =cut

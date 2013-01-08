@@ -1,105 +1,99 @@
 package Mojo;
+use Mojo::Base -base;
 
-use strict;
-use warnings;
-
-use base 'Mojo::Base';
-
+# "Professor: These old Doomsday devices are dangerously unstable. I'll rest
+#             easier not knowing where they are."
 use Carp 'croak';
-use Mojo::Client;
-use Mojo::Commands;
 use Mojo::Home;
 use Mojo::Log;
 use Mojo::Transaction::HTTP;
-use Mojo::Transaction::WebSocket;
+use Mojo::UserAgent;
+use Scalar::Util 'weaken';
 
-__PACKAGE__->attr(
-    build_tx_cb => sub {
-        sub { return Mojo::Transaction::HTTP->new }
-    }
-);
-__PACKAGE__->attr(client => sub { Mojo::Client->singleton });
-__PACKAGE__->attr(home   => sub { Mojo::Home->new });
-__PACKAGE__->attr(log    => sub { Mojo::Log->new });
-__PACKAGE__->attr(
-    websocket_handshake_cb => sub {
-        sub {
-            return Mojo::Transaction::WebSocket->new(handshake => pop)
-              ->server_handshake;
-          }
-    }
-);
+has home => sub { Mojo::Home->new };
+has log  => sub { Mojo::Log->new };
+has ua   => sub {
+  my $self = shift;
 
-# DEPRECATED in Snowman!
-# Use $Mojolicious::VERSION instead
-our $VERSION = '0.999930';
+  # Fresh user agent
+  my $ua = Mojo::UserAgent->new->app($self);
+  weaken $self;
+  $ua->on(error => sub { $self->log->error($_[1]) });
+  weaken $ua->{app};
 
-# Oh, so they have internet on computers now!
+  return $ua;
+};
+
 sub new {
-    my $self = shift->SUPER::new(@_);
+  my $self = shift->SUPER::new(@_);
 
-    # Home
-    $self->home->detect(ref $self);
+  # Detect home directory
+  my $home = $self->home->detect(ref $self);
 
-    # Client logger
-    $self->client->log($self->log);
+  # Log directory
+  $self->log->path($home->rel_file('log/mojo.log'))
+    if -w $home->rel_file('log');
 
-    # Log directory
-    $self->log->path($self->home->rel_file('log/mojo.log'))
-      if -w $self->home->rel_file('log');
-
-    return $self;
+  return $self;
 }
 
-# Bart, stop pestering Satan!
+sub build_tx { Mojo::Transaction::HTTP->new }
+
+sub config { shift->_dict(config => @_) }
+
 sub handler { croak 'Method "handler" not implemented in subclass' }
 
-# Start command system
-sub start {
-    my $class = shift;
+sub _dict {
+  my ($self, $name) = (shift, shift);
 
-    # We can be called on class or instance
-    $class = ref $class || $class;
+  # Hash
+  my $dict = $self->{$name} ||= {};
+  return $dict unless @_;
 
-    # We are the application
-    $ENV{MOJO_APP} ||= $class;
+  # Get
+  return $dict->{$_[0]} unless @_ > 1 || ref $_[0];
 
-    # Start!
-    return Mojo::Commands->start(@_);
+  # Set
+  %$dict = (%$dict, %{ref $_[0] ? $_[0] : {@_}});
+
+  return $self;
 }
 
 1;
-__END__
 
 =head1 NAME
 
-Mojo - The Box!
+Mojo - Duct tape for the HTML5 web!
 
 =head1 SYNOPSIS
 
-    use base 'Mojo';
+  package MyApp;
+  use Mojo::Base 'Mojo';
 
-    # All the complexities of CGI, FastCGI, PSGI, HTTP and WebSockets get
-    # reduced to a single method call!
-    sub handler {
-        my ($self, $tx) = @_;
+  # All the complexities of CGI, PSGI, HTTP and WebSockets get reduced to a
+  # single method call!
+  sub handler {
+    my ($self, $tx) = @_;
 
-        # Request
-        my $method = $tx->req->method;
-        my $path   = $tx->req->url->path;
+    # Request
+    my $method = $tx->req->method;
+    my $path   = $tx->req->url->path;
 
-        # Response
-        $tx->res->code(200);
-        $tx->res->headers->content_type('text/plain');
-        $tx->res->body("$method request for $path!");
-        $tx->resume;
-    }
+    # Response
+    $tx->res->code(200);
+    $tx->res->headers->content_type('text/plain');
+    $tx->res->body("$method request for $path!");
+
+    # Resume transaction
+    $tx->resume;
+  }
 
 =head1 DESCRIPTION
 
-Mojo provides a flexible runtime environment for Perl web frameworks.
-It provides all the basic tools and helpers needed to write simple web
-applications and higher level web frameworks such as L<Mojolicious>.
+Mojo provides a flexible runtime environment for Perl real-time web
+frameworks. It provides all the basic tools and helpers needed to write
+simple web applications and higher level web frameworks, such as
+L<Mojolicious>.
 
 See L<Mojolicious> for more!
 
@@ -107,80 +101,89 @@ See L<Mojolicious> for more!
 
 L<Mojo> implements the following attributes.
 
-=head2 C<build_tx_cb>
+=head2 home
 
-    my $cb = $app->build_tx_cb;
-    $app   = $app->build_tx_cb(sub { ... });
+  my $home = $app->home;
+  $app     = $app->home(Mojo::Home->new);
 
-The transaction builder callback, by default it builds a
-L<Mojo::Transaction::HTTP> object.
-
-=head2 C<client>
-
-    my $client = $app->client;
-    $app       = $app->client(Mojo::Client->new);
-
-A full featured HTTP 1.1 client for use in your applications, by default a
-L<Mojo::Client> object.
-
-=head2 C<home>
-
-    my $home = $app->home;
-    $app     = $app->home(Mojo::Home->new);
-
-The home directory of your application, by default a L<Mojo::Home> object
+The home directory of your application, defaults to a L<Mojo::Home> object
 which stringifies to the actual path.
 
-=head2 C<log>
+  # Generate portable path relative to home directory
+  my $path = $app->home->rel_file('data/important.txt');
 
-    my $log = $app->log;
-    $app    = $app->log(Mojo::Log->new);
-    
-The logging layer of your application, by default a L<Mojo::Log> object.
+=head2 log
 
-=head2 C<websocket_handshake_cb>
+  my $log = $app->log;
+  $app    = $app->log(Mojo::Log->new);
 
-    my $cb = $app->websocket_handshake_cb;
-    $app   = $app->websocket_handshake_cb(sub { ... });
+The logging layer of your application, defaults to a L<Mojo::Log> object.
 
-The websocket handshake callback, by default it builds a
-L<Mojo::Transaction::WebSocket> object and handles the response for the
-handshake request.
+  # Log debug message
+  $app->log->debug('It works!');
+
+=head2 ua
+
+  my $ua = $app->ua;
+  $app   = $app->ua(Mojo::UserAgent->new);
+
+A full featured HTTP user agent for use in your applications, defaults to a
+L<Mojo::UserAgent> object. Note that this user agent should not be used in
+plugins, since non-blocking requests that are already in progress will
+interfere with new blocking ones.
+
+  # Perform blocking request
+  my $body = $app->ua->get('mojolicio.us')->res->body;
 
 =head1 METHODS
 
 L<Mojo> inherits all methods from L<Mojo::Base> and implements the following
 new ones.
 
-=head2 C<new>
+=head2 new
 
-    my $app = Mojo->new;
+  my $app = Mojo->new;
 
-Construct a new L<Mojo> application.
-Will automatically detect your home directory and set up logging to
-C<log/mojo.log> if there's a log directory.
+Construct a new L<Mojo> application. Will automatically detect your home
+directory and set up logging to C<log/mojo.log> if there's a C<log> directory.
 
-=head2 C<handler>
+=head2 build_tx
 
-    $tx = $app->handler($tx);
+  my $tx = $app->build_tx;
 
-The handler is the main entry point to your application or framework and
-will be called for each new transaction, usually a L<Mojo::Transaction::HTTP>
-or L<Mojo::Transaction::WebSocket> object.
+Transaction builder, defaults to building a L<Mojo::Transaction::HTTP>
+object.
 
-    sub handler {
-        my ($self, $tx) = @_;
-    }
+=head2 config
 
-=head2 C<start>
+  my $config = $app->config;
+  my $foo    = $app->config('foo');
+  $app       = $app->config({foo => 'bar'});
+  $app       = $app->config(foo => 'bar');
 
-    Mojo->start;
-    Mojo->start('daemon');
+Application configuration.
 
-Start the L<Mojo::Commands> command line interface for your application.
+  # Manipulate configuration
+  $app->config->{foo} = 'bar';
+  my $foo = $app->config->{foo};
+  delete $app->config->{foo};
+
+=head2 handler
+
+  $app->handler(Mojo::Transaction::HTTP->new);
+
+The handler is the main entry point to your application or framework and will
+be called for each new transaction, which will usually be a
+L<Mojo::Transaction::HTTP> or L<Mojo::Transaction::WebSocket> object. Meant to
+be overloaded in a subclass.
+
+  sub handler {
+    my ($self, $tx) = @_;
+    ...
+  }
 
 =head1 SEE ALSO
 
-L<Mojolicious>, L<Mojolicious::Guides>, L<http://mojolicious.org>.
+L<Mojolicious>, L<Mojolicious::Guides>, L<http://mojolicio.us>.
 
 =cut

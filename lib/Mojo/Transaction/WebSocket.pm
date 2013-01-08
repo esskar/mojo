@@ -1,407 +1,581 @@
 package Mojo::Transaction::WebSocket;
+use Mojo::Base 'Mojo::Transaction';
 
-use strict;
-use warnings;
-
-# I'm not calling you a liar but...
-# I can't think of a way to finish that sentence.
-use base 'Mojo::Transaction';
-
-use Mojo::ByteStream 'b';
+use Config;
 use Mojo::Transaction::HTTP;
+use Mojo::Util qw(b64_encode decode encode sha1_bytes xor_encode);
 
-__PACKAGE__->attr(
-    receive_message => sub {
-        sub { }
-    }
-);
-__PACKAGE__->attr(handshake => sub { Mojo::Transaction::HTTP->new });
+use constant DEBUG => $ENV{MOJO_WEBSOCKET_DEBUG} || 0;
 
-sub client_challenge {
-    my $self = shift;
+# 64bit Perl
+use constant MODERN => $Config{ivsize} > 4;
 
-    # Request
-    my $req = $self->req;
+# Unique value from the spec
+use constant GUID => '258EAFA5-E914-47DA-95CA-C5AB0DC85B11';
 
-    # Headers
-    my $headers = $self->req->headers;
+# Opcodes
+use constant {
+  CONTINUATION => 0,
+  TEXT         => 1,
+  BINARY       => 2,
+  CLOSE        => 8,
+  PING         => 9,
+  PONG         => 10
+};
 
-    # WebSocket challenge
-    my $solution = $self->_challenge(scalar $headers->sec_websocket_key1,
-        scalar $headers->sec_websocket_key2, $req->body);
-    return unless $solution eq $self->res->body;
-    return 1;
+has handshake => sub { Mojo::Transaction::HTTP->new };
+has 'masked';
+has max_websocket_size => sub { $ENV{MOJO_MAX_WEBSOCKET_SIZE} || 262144 };
+
+sub new {
+  my $self = shift->SUPER::new(@_);
+  $self->on(frame => sub { shift->_message(@_) });
+  return $self;
 }
 
-sub client_close { shift->server_close(@_) }
+sub build_frame {
+  my ($self, $fin, $rsv1, $rsv2, $rsv3, $op, $payload) = @_;
+  warn "-- Building frame ($fin, $rsv1, $rsv2, $rsv3, $op)\n" if DEBUG;
+
+  # Head
+  my $frame = 0b00000000;
+  vec($frame, 0, 8) = $op | 0b10000000 if $fin;
+  vec($frame, 0, 8) |= 0b01000000 if $rsv1;
+  vec($frame, 0, 8) |= 0b00100000 if $rsv2;
+  vec($frame, 0, 8) |= 0b00010000 if $rsv3;
+
+  # Small payload
+  my $len    = length $payload;
+  my $prefix = 0;
+  my $masked = $self->masked;
+  if ($len < 126) {
+    warn "-- Small payload ($len)\n$payload\n" if DEBUG;
+    vec($prefix, 0, 8) = $masked ? ($len | 0b10000000) : $len;
+    $frame .= $prefix;
+  }
+
+  # Extended payload (16bit)
+  elsif ($len < 65536) {
+    warn "-- Extended 16bit payload ($len)\n$payload\n" if DEBUG;
+    vec($prefix, 0, 8) = $masked ? (126 | 0b10000000) : 126;
+    $frame .= $prefix;
+    $frame .= pack 'n', $len;
+  }
+
+  # Extended payload (64bit with 32bit fallback)
+  else {
+    warn "-- Extended 64bit payload ($len)\n$payload\n" if DEBUG;
+    vec($prefix, 0, 8) = $masked ? (127 | 0b10000000) : 127;
+    $frame .= $prefix;
+    $frame .= MODERN ? pack('Q>', $len) : pack('NN', 0, $len & 0xFFFFFFFF);
+  }
+
+  # Mask payload
+  if ($masked) {
+    my $mask = pack 'N', int(rand 9999999);
+    $payload = $mask . xor_encode($payload, $mask x 128);
+  }
+
+  return $frame . $payload;
+}
+
+sub client_challenge {
+  my $self = shift;
+  return _challenge($self->req->headers->sec_websocket_key) eq
+    $self->res->headers->sec_websocket_accept;
+}
 
 sub client_handshake {
-    my $self = shift;
+  my $self = shift;
 
-    # Request
-    my $req = $self->req;
+  # Default headers
+  my $headers = $self->req->headers;
+  $headers->upgrade('websocket')  unless $headers->upgrade;
+  $headers->connection('Upgrade') unless $headers->connection;
+  $headers->sec_websocket_protocol('mojo')
+    unless $headers->sec_websocket_protocol;
+  $headers->sec_websocket_version(13) unless $headers->sec_websocket_version;
 
-    # Headers
-    my $headers = $req->headers;
-
-    # Default headers
-    $headers->upgrade('WebSocket')  unless $headers->upgrade;
-    $headers->connection('Upgrade') unless $headers->connection;
-    $headers->sec_websocket_protocol('mojo')
-      unless $headers->sec_websocket_protocol;
-
-    # Generate challenge
-    $headers->sec_websocket_key1($self->_generate_key)
-      unless $headers->sec_websocket_key1;
-    $headers->sec_websocket_key2($self->_generate_key)
-      unless $headers->sec_websocket_key2;
-    $req->body(pack 'N*', int(rand 9999999) + 1, int(rand 9999999) + 1);
-
-    return $self;
+  # Generate WebSocket challenge
+  $headers->sec_websocket_key(b64_encode(pack('N*', int(rand 9999999)), ''))
+    unless $headers->sec_websocket_key;
 }
 
 sub client_read  { shift->server_read(@_) }
 sub client_write { shift->server_write(@_) }
-sub connection   { shift->handshake->connection(@_) }
+
+sub connection { shift->handshake->connection }
 
 sub finish {
-    my $self = shift;
-
-    # Send closing handshake
-    $self->_send_bytes("\xff");
-
-    # Finish after writing
-    return $self->{_finished} = 1;
+  my $self = shift;
+  $self->send([1, 0, 0, 0, CLOSE, ''])->{finished} = 1;
+  return $self;
 }
 
 sub is_websocket {1}
 
-sub local_address  { shift->handshake->local_address }
-sub local_port     { shift->handshake->local_port }
-sub remote_address { shift->handshake->remote_address }
-sub remote_port    { shift->handshake->remote_port }
-sub req            { shift->handshake->req(@_) }
-sub res            { shift->handshake->res(@_) }
+sub kept_alive    { shift->handshake->kept_alive }
+sub local_address { shift->handshake->local_address }
+sub local_port    { shift->handshake->local_port }
 
-sub resume {
-    my $self = shift;
+sub parse_frame {
+  my ($self, $buffer) = @_;
 
-    # Resume
-    $self->handshake->resume;
+  # Head
+  return undef unless length(my $clone = $$buffer) >= 2;
+  my $head = substr $clone, 0, 2;
 
-    return $self;
+  # FIN
+  my $fin = (vec($head, 0, 8) & 0b10000000) == 0b10000000 ? 1 : 0;
+
+  # RSV1-3
+  my $rsv1 = (vec($head, 0, 8) & 0b01000000) == 0b01000000 ? 1 : 0;
+  my $rsv2 = (vec($head, 0, 8) & 0b00100000) == 0b00100000 ? 1 : 0;
+  my $rsv3 = (vec($head, 0, 8) & 0b00010000) == 0b00010000 ? 1 : 0;
+
+  # Opcode
+  my $op = vec($head, 0, 8) & 0b00001111;
+  warn "-- Parsing frame ($fin, $rsv1, $rsv2, $rsv3, $op)\n" if DEBUG;
+
+  # Small payload
+  my $len = vec($head, 1, 8) & 0b01111111;
+  my $hlen = 2;
+  if ($len < 126) { warn "-- Small payload ($len)\n" if DEBUG }
+
+  # Extended payload (16bit)
+  elsif ($len == 126) {
+    return undef unless length $clone > 4;
+    $hlen = 4;
+    $len = unpack 'n', substr($clone, 2, 2);
+    warn "-- Extended 16bit payload ($len)\n" if DEBUG;
+  }
+
+  # Extended payload (64bit with 32bit fallback)
+  elsif ($len == 127) {
+    return undef unless length $clone > 10;
+    $hlen = 10;
+    my $ext = substr $clone, 2, 8;
+    $len = MODERN ? unpack('Q>', $ext) : unpack('N', substr($ext, 4, 4));
+    warn "-- Extended 64bit payload ($len)\n" if DEBUG;
+  }
+
+  # Check message size
+  $self->finish and return undef if $len > $self->max_websocket_size;
+
+  # Check if whole packet has arrived
+  my $masked = vec($head, 1, 8) & 0b10000000;
+  return undef if length $clone < ($len + $hlen + ($masked ? 4 : 0));
+  substr $clone, 0, $hlen, '';
+
+  # Payload
+  $len += 4 if $masked;
+  return undef if length $clone < $len;
+  my $payload = $len ? substr($clone, 0, $len, '') : '';
+
+  # Unmask payload
+  $payload = xor_encode($payload, substr($payload, 0, 4, '') x 128) if $masked;
+  warn "$payload\n" if DEBUG;
+  $$buffer = $clone;
+
+  return [$fin, $rsv1, $rsv2, $rsv3, $op, $payload];
 }
 
-sub send_message {
-    my ($self, $message) = @_;
+sub remote_address { shift->handshake->remote_address }
+sub remote_port    { shift->handshake->remote_port }
+sub req            { shift->handshake->req }
+sub res            { shift->handshake->res }
 
-    # Encode
-    $message = b($message)->encode('UTF-8')->to_string;
+sub resume {
+  my $self = shift;
+  $self->handshake->resume;
+  return $self;
+}
 
-    # Send message with framing
-    $self->_send_bytes("\x00$message\xff");
+sub send {
+  my ($self, $frame, $cb) = @_;
+
+  # Binary or raw text
+  if (ref $frame eq 'HASH') {
+    $frame
+      = exists $frame->{text}
+      ? [1, 0, 0, 0, TEXT, $frame->{text}]
+      : [1, 0, 0, 0, BINARY, $frame->{binary}];
+  }
+
+  # Text
+  elsif (!ref $frame) { $frame = [1, 0, 0, 0, TEXT, encode('UTF-8', $frame)] }
+
+  # Prepare frame
+  $self->once(drain => $cb) if $cb;
+  $self->{write} .= $self->build_frame(@$frame);
+  $self->{state} = 'write';
+
+  # Resume
+  return $self->emit('resume');
 }
 
 sub server_handshake {
-    my $self = shift;
+  my $self = shift;
 
-    # Request
-    my $req = $self->req;
-
-    # Response
-    my $res = $self->res;
-
-    # Request headers
-    my $rqh = $req->headers;
-
-    # Response headers
-    my $rsh = $res->headers;
-
-    # URL
-    my $url = $req->url;
-
-    # Handshake
-    $res->code(101);
-    $rsh->upgrade('WebSocket');
-    $rsh->connection('Upgrade');
-    my $scheme   = $url->to_abs->scheme eq 'https' ? 'wss' : 'ws';
-    my $location = $url->to_abs->scheme($scheme)->to_string;
-    my $origin   = $rqh->origin;
-    $rsh->sec_websocket_origin($origin);
-    $rsh->sec_websocket_location($location);
-    $rsh->sec_websocket_protocol($rqh->sec_websocket_protocol);
-    $res->body(
-        $self->_challenge(
-            scalar $rqh->sec_websocket_key1,
-            scalar $rqh->sec_websocket_key2,
-            $req->body
-        )
-    );
-
-    return $self;
+  # WebSocket handshake
+  my $res_headers = $self->res->code(101)->headers;
+  $res_headers->upgrade('websocket')->connection('Upgrade');
+  my $req_headers = $self->req->headers;
+  ($req_headers->sec_websocket_protocol || '') =~ /^\s*([^,]+)/
+    and $res_headers->sec_websocket_protocol($1);
+  $res_headers->sec_websocket_accept(
+    _challenge($req_headers->sec_websocket_key));
 }
 
-# Being eaten by crocodile is just like going to sleep... in a giant blender.
 sub server_read {
-    my ($self, $chunk) = @_;
+  my ($self, $chunk) = @_;
 
-    # Add chunk
-    my $buffer = $self->{_read} ||= Mojo::ByteStream->new;
-    $buffer->add_chunk($chunk);
+  # Parse frames
+  $self->{read} .= $chunk // '';
+  while (my $frame = $self->parse_frame(\$self->{read})) {
+    $self->emit(frame => $frame);
+  }
 
-    # Full frames
-    while ((my $i = $buffer->contains("\xff")) >= 0) {
-
-        # Closing handshake
-        return $self->finish if $i == 0;
-
-        # Frame
-        my $message = $buffer->remove($i + 1);
-
-        # Remove framing
-        $message =~ s/^[\x00]//;
-        $message =~ s/[\xff]$//;
-
-        # Callback
-        $self->receive_message->(
-            $self, b($message)->decode('UTF-8')->to_string
-        );
-    }
-
-    # Resume
-    $self->resume_cb->($self);
-
-    return $self;
+  # Resume
+  $self->emit('resume');
 }
 
 sub server_write {
-    my $self = shift;
+  my $self = shift;
 
-    # Not writing anymore
-    my $write = $self->{_write} ||= Mojo::ByteStream->new;
-    unless ($write->size) {
-        $self->{_state} = $self->{_finished} ? 'done' : 'read';
-    }
+  # Drain
+  unless (length($self->{write} // '')) {
+    $self->{state} = $self->{finished} ? 'finished' : 'read';
+    $self->emit('drain');
+  }
 
-    # Empty buffer
-    return $write->empty;
+  # Empty buffer
+  return delete $self->{write} // '';
 }
 
-sub _challenge {
-    my ($self, $key1, $key2, $key3) = @_;
+sub _challenge { b64_encode(sha1_bytes(($_[0] || '') . GUID), '') }
 
-    # Shortcut
-    return unless $key1 && $key2 && $key3;
+sub _message {
+  my ($self, $frame) = @_;
 
-    # Calculate solution for challenge
-    my $c1 = pack 'N', join('', $key1 =~ /(\d)/g) / ($key1 =~ tr/\ //);
-    my $c2 = pack 'N', join('', $key2 =~ /(\d)/g) / ($key2 =~ tr/\ //);
-    return b("$c1$c2$key3")->md5_bytes->to_string;
-}
+  # Assume continuation
+  my $op = $frame->[4] || CONTINUATION;
 
-sub _generate_key {
-    my $self = shift;
+  # Ping/Pong
+  return $self->send([1, 0, 0, 0, PONG, $frame->[5]]) if $op == PING;
+  return if $op == PONG;
 
-    # Number of spaces
-    my $spaces = int(rand 12) + 1;
+  # Close
+  return $self->finish if $op == CLOSE;
 
-    # Number
-    my $number = int(rand 99999) + 10;
+  # Append chunk and check message size
+  $self->{op} = $op unless exists $self->{op};
+  $self->{message} .= $frame->[5];
+  $self->finish and last
+    if length $self->{message} > $self->max_websocket_size;
 
-    # Key
-    my $key = $number * $spaces;
+  # No FIN bit (Continuation)
+  return unless $frame->[0];
 
-    # Insert whitespace
-    while ($spaces--) {
-
-        # Random position
-        my $pos = int(rand(length($key) - 2)) + 1;
-
-        # Insert a space at $pos position
-        substr($key, $pos, 0) = ' ';
-    }
-
-    return $key;
-}
-
-sub _send_bytes {
-    my ($self, $bytes) = @_;
-
-    # Add to buffer
-    my $write = $self->{_write} ||= Mojo::ByteStream->new;
-    $write->add_chunk($bytes);
-
-    # Writing
-    $self->{_state} = 'write';
-
-    # Resume
-    $self->resume_cb->($self);
+  # Message
+  my $msg = delete $self->{message};
+  $msg = decode 'UTF-8', $msg if $msg && delete $self->{op} == TEXT;
+  $self->emit(message => $msg);
 }
 
 1;
-__END__
 
 =head1 NAME
 
-Mojo::Transaction::WebSocket - WebSocket Transaction Container
+Mojo::Transaction::WebSocket - WebSocket transaction
 
 =head1 SYNOPSIS
 
-    use Mojo::Transaction::WebSocket;
+  use Mojo::Transaction::WebSocket;
+
+  # Send and receive WebSocket messages
+  my $ws = Mojo::Transaction::WebSocket->new;
+  $ws->send('Hello World!');
+  $ws->on(message => sub {
+    my ($ws, $msg) = @_;
+    say "Message: $msg";
+  });
+  $ws->on(finish => sub {
+    my $ws = shift;
+    say 'WebSocket closed.';
+  });
 
 =head1 DESCRIPTION
 
 L<Mojo::Transaction::WebSocket> is a container for WebSocket transactions as
-described in C<The WebSocket protocol>.
+described in RFC 6455. Note that 64bit frames require a Perl with 64bit
+integer support, or they are limited to 32bit.
+
+=head1 EVENTS
+
+L<Mojo::Transaction::WebSocket> inherits all events from L<Mojo::Transaction>
+and can emit the following new ones.
+
+=head2 drain
+
+  $ws->on(drain => sub {
+    my $ws = shift;
+    ...
+  });
+
+Emitted once all data has been sent.
+
+  $ws->on(drain => sub {
+    my $ws = shift;
+    $ws->send(time);
+  });
+
+=head2 frame
+
+  $ws->on(frame => sub {
+    my ($ws, $frame) = @_;
+    ...
+  });
+
+Emitted when a WebSocket frame has been received.
+
+  $ws->unsubscribe('frame');
+  $ws->on(frame => sub {
+    my ($ws, $frame) = @_;
+    say "FIN: $frame->[0]";
+    say "RSV1: $frame->[1]";
+    say "RSV2: $frame->[2]";
+    say "RSV3: $frame->[3]";
+    say "Opcode: $frame->[4]";
+    say "Payload: $frame->[5]";
+  });
+
+=head2 message
+
+  $ws->on(message => sub {
+    my ($ws, $msg) = @_;
+    ...
+  });
+
+Emitted when a complete WebSocket message has been received.
+
+  $ws->on(message => sub {
+    my ($ws, $msg) = @_;
+    say "Message: $msg";
+  });
 
 =head1 ATTRIBUTES
 
 L<Mojo::Transaction::WebSocket> inherits all attributes from
 L<Mojo::Transaction> and implements the following new ones.
 
-=head2 C<handshake>
+=head2 handshake
 
-    my $handshake = $ws->handshake;
-    $ws           = $ws->handshake(Mojo::Transaction::HTTP->new);
+  my $handshake = $ws->handshake;
+  $ws           = $ws->handshake(Mojo::Transaction::HTTP->new);
 
-The original handshake transaction.
+The original handshake transaction, defaults to a L<Mojo::Transaction::HTTP>
+object.
 
-=head2 C<receive_message>
+=head2 masked
 
-    my $cb = $ws->receive_message;
-    $ws    = $ws->receive_message(sub {...});
+  my $masked = $ws->masked;
+  $ws        = $ws->masked(1);
 
-The callback that receives decoded messages one by one.
+Mask outgoing frames with XOR cipher and a random 32bit key.
 
-    $ws->receive_message(sub {
-        my ($self, $message) = @_;
-    });
+=head2 max_websocket_size
+
+  my $size = $ws->max_websocket_size;
+  $ws      = $ws->max_websocket_size(1024);
+
+Maximum WebSocket message size in bytes, defaults to the value of the
+C<MOJO_MAX_WEBSOCKET_SIZE> environment variable or C<262144>.
 
 =head1 METHODS
 
 L<Mojo::Transaction::WebSocket> inherits all methods from
 L<Mojo::Transaction> and implements the following new ones.
 
-=head2 C<client_challenge>
+=head2 new
 
-    my $success = $ws->client_challenge;
+  my $multi = Mojo::Content::MultiPart->new;
 
-Check WebSocket handshake challenge, only used by client.
-Note that this method is EXPERIMENTAL and might change without warning!
+Construct a new L<Mojo::Transaction::WebSocket> object and subscribe to
+C<frame> event with default message parser, which also handles C<PING> and
+C<CLOSE> frames automatically.
 
-=head2 C<client_close>
+=head2 build_frame
 
-    $ws = $ws->client_close;
+  my $bytes = $ws->build_frame($fin, $rsv1, $rsv2, $rsv3, $op, $payload);
 
-Connection got closed, only used by clients.
+Build WebSocket frame.
 
-=head2 C<client_handshake>
+  # Continuation frame with FIN bit and payload
+  say $ws->build_frame(1, 0, 0, 0, 0, 'World!');
 
-    $ws = $ws->client_handshake;
+  # Text frame with payload
+  say $ws->build_frame(0, 0, 0, 0, 1, 'Hello');
 
-WebSocket handshake, only used by clients.
-Note that this method is EXPERIMENTAL and might change without warning!
+  # Binary frame with FIN bit and payload
+  say $ws->build_frame(1, 0, 0, 0, 2, 'Hello World!');
 
-=head2 C<client_read>
+  # Close frame with FIN bit and without payload
+  say $ws->build_frame(1, 0, 0, 0, 8, '');
 
-    $ws = $ws->client_read($data);
+  # Ping frame with FIN bit and payload
+  say $ws->build_frame(1, 0, 0, 0, 9, 'Test 123');
 
-Read raw WebSocket data, only used by clients.
+  # Pong frame with FIN bit and payload
+  say $ws->build_frame(1, 0, 0, 0, 10, 'Test 123');
 
-=head2 C<client_write>
+=head2 client_challenge
 
-    my $chunk = $ws->client_write;
+  my $success = $ws->client_challenge;
 
-Raw WebSocket data to write, only used by clients.
+Check WebSocket handshake challenge client-side, used to implement user
+agents.
 
-=head2 C<connection>
+=head2 client_handshake
 
-    my $connection = $ws->connection;
+  $ws->client_handshake;
 
-The connection this websocket is using.
+Perform WebSocket handshake client-side, used to implement user agents.
 
-=head2 C<finish>
+=head2 client_read
 
-    $ws->finish;
+  $ws->client_read($data);
+
+Read data client-side, used to implement user agents.
+
+=head2 client_write
+
+  my $chunk = $ws->client_write;
+
+Write data client-side, used to implement user agents.
+
+=head2 connection
+
+  my $connection = $ws->connection;
+
+Connection identifier or socket.
+
+=head2 finish
+
+  $ws = $ws->finish;
 
 Finish the WebSocket connection gracefully.
 
-=head2 C<is_websocket>
+=head2 is_websocket
 
-    my $is_websocket = $ws->is_websocket;
+  my $true = $ws->is_websocket;
 
 True.
 
-=head2 C<local_address>
+=head2 kept_alive
 
-    my $local_address = $ws->local_address;
+  my $kept_alive = $ws->kept_alive;
 
-The local address of this WebSocket.
+Connection has been kept alive.
 
-=head2 C<local_port>
+=head2 local_address
 
-    my $local_port = $ws->local_port;
+  my $address = $ws->local_address;
 
-The local port of this WebSocket.
+Local interface address.
 
-=head2 C<remote_address>
+=head2 local_port
 
-    my $remote_address = $ws->remote_address;
+  my $port = $ws->local_port;
 
-The remote address of this WebSocket.
+Local interface port.
 
-=head2 C<remote_port>
+=head2 parse_frame
 
-    my $remote_port = $ws->remote_port;
+  my $frame = $ws->parse_frame(\$bytes);
 
-The remote port of this WebSocket.
+Parse WebSocket frame.
 
-=head2 C<req>
+  # Parse single frame and remove it from buffer
+  my $frame = $ws->parse_frame(\$buffer);
+  say "FIN: $frame->[0]";
+  say "RSV1: $frame->[1]";
+  say "RSV2: $frame->[2]";
+  say "RSV3: $frame->[3]";
+  say "Opcode: $frame->[4]";
+  say "Payload: $frame->[5]";
 
-    my $req = $ws->req;
+=head2 remote_address
 
-The original handshake request.
+  my $address = $ws->remote_address;
 
-=head2 C<res>
+Remote interface address.
 
-    my $req = $ws->res;
+=head2 remote_port
 
-The original handshake response.
+  my $port = $ws->remote_port;
 
-=head2 C<resume>
+Remote interface port.
 
-    $ws = $ws->resume;
+=head2 req
 
-Resume transaction.
+  my $req = $ws->req;
 
-=head2 C<send_message>
+Handshake request, usually a L<Mojo::Message::Request> object.
 
-    $ws->send_message('Hi there!');
+=head2 res
 
-Send a message over the WebSocket, encoding and framing will be handled
-transparently.
+  my $res = $ws->res;
 
-=head2 C<server_handshake>
+Handshake response, usually a L<Mojo::Message::Response> object.
 
-    $ws = $ws->server_handshake;
+=head2 resume
 
-WebSocket handshake, only used by servers.
-Note that this method is EXPERIMENTAL and might change without warning!
+  $ws = $ws->resume;
 
-=head2 C<server_read>
+Resume C<handshake> transaction.
 
-    $ws = $ws->server_read($data);
+=head2 send
 
-Read raw WebSocket data, only used by servers.
+  $ws = $ws->send({binary => $bytes});
+  $ws = $ws->send({text   => $bytes});
+  $ws = $ws->send([$fin, $rsv1, $rsv2, $rsv3, $op, $bytes]);
+  $ws = $ws->send($chars);
+  $ws = $ws->send($chars => sub {...});
 
-=head2 C<server_write>
+Send message or frame non-blocking via WebSocket, the optional drain callback
+will be invoked once all data has been written.
 
-    my $chunk = $ws->server_write;
+  # Send "Ping" frame
+  $ws->send([1, 0, 0, 0, 9, 'Hello World!']);
 
-Raw WebSocket data to write, only used by servers.
+=head2 server_handshake
+
+  $ws->server_handshake;
+
+Perform WebSocket handshake server-side, used to implement web servers.
+
+=head2 server_read
+
+  $ws->server_read($data);
+
+Read data server-side, used to implement web servers.
+
+=head2 server_write
+
+  my $chunk = $ws->server_write;
+
+Write data server-side, used to implement web servers.
+
+=head1 DEBUGGING
+
+You can set the C<MOJO_WEBSOCKET_DEBUG> environment variable to get some
+advanced diagnostics information printed to C<STDERR>.
+
+  MOJO_WEBSOCKET_DEBUG=1
 
 =head1 SEE ALSO
 
-L<Mojolicious>, L<Mojolicious::Guides>, L<http://mojolicious.org>.
+L<Mojolicious>, L<Mojolicious::Guides>, L<http://mojolicio.us>.
 
 =cut

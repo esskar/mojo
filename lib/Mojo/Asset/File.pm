@@ -1,285 +1,258 @@
 package Mojo::Asset::File;
+use Mojo::Base 'Mojo::Asset';
 
-use strict;
-use warnings;
-
-use base 'Mojo::Asset';
-
-# We can't use File::Temp because there is no seek support in the version
-# shipped with Perl 5.8
 use Carp 'croak';
-use File::Copy ();
+use Errno 'EEXIST';
+use Fcntl qw(O_CREAT O_EXCL O_RDWR);
+use File::Copy 'move';
 use File::Spec;
 use IO::File;
-use Mojo::ByteStream 'b';
+use Mojo::Util 'md5_sum';
 
-__PACKAGE__->attr([qw/cleanup path/]);
-__PACKAGE__->attr(tmpdir => sub { $ENV{MOJO_TMPDIR} || File::Spec->tmpdir });
-__PACKAGE__->attr(
-    handle => sub {
-        my $self   = shift;
-        my $handle = IO::File->new;
+has [qw(cleanup path)];
+has handle => sub {
+  my $self = shift;
 
-        # Already got a file without handle
-        my $file = $self->path;
-        if ($file) {
+  # Open existing file
+  my $handle = IO::File->new;
+  my $path   = $self->path;
+  if (defined $path && -f $path) {
+    $handle->open("< $path") or croak qq{Can't open file "$path": $!};
+    return $handle;
+  }
 
-            # New file
-            my $mode = '+>>';
+  # Open new or temporary file
+  my $base = File::Spec->catfile($self->tmpdir, 'mojo.tmp');
+  my $name = $path // $base;
+  until ($handle->open($name, O_CREAT | O_EXCL | O_RDWR)) {
+    croak qq{Can't open file "$name": $!} if defined $path || $! != $!{EEXIST};
+    $name = "$base." . md5_sum(time . $$ . rand 9999999);
+  }
+  $self->path($name);
 
-            # File exists
-            $mode = '<' if -s $file;
+  # Enable automatic cleanup
+  $self->cleanup(1) unless defined $self->cleanup;
 
-            # Open
-            $handle->open("$mode $file")
-              or croak qq/Can't open file "$file": $!/;
-            return $handle;
-        }
-
-        # Generate temporary file
-        my $base = File::Spec->catfile($self->tmpdir, 'mojo.tmp');
-        $file = $base;
-        while (-e $file) {
-            my $sum = b(time . rand(999999999))->md5_sum;
-            $file = "$base.$sum";
-        }
-        $self->path($file);
-
-        # Enable automatic cleanup
-        $self->cleanup(1);
-
-        # Open for read/write access
-        $handle->open("+> $file") or croak qq/Can't open file "$file": $!/;
-        return $handle;
-    }
-);
+  return $handle;
+};
+has tmpdir => sub { $ENV{MOJO_TMPDIR} || File::Spec->tmpdir };
 
 sub DESTROY {
-    my $self = shift;
-    my $file = $self->path;
-
-    # Cleanup
-    unlink $file if $self->cleanup && -f $file;
+  my $self = shift;
+  return unless $self->cleanup && defined(my $path = $self->path);
+  close $self->handle;
+  unlink $path if -w $path;
 }
 
 sub add_chunk {
-    my ($self, $chunk) = @_;
+  my ($self, $chunk) = @_;
 
-    # Seek to end
-    $self->handle->sysseek(0, SEEK_END);
+  my $handle = $self->handle;
+  $handle->sysseek(0, SEEK_END);
+  $chunk //= '';
+  croak "Can't write to asset: $!"
+    unless defined $handle->syswrite($chunk, length $chunk);
 
-    # Store
-    $chunk = '' unless defined $chunk;
-    utf8::encode $chunk if utf8::is_utf8 $chunk;
-    $self->handle->syswrite($chunk, length $chunk);
-
-    return $self;
+  return $self;
 }
 
-# Your guilty consciences may make you vote Democratic, but secretly you all
-# yearn for a Republican president to lower taxes, brutalize criminals, and
-# rule you like a king!
 sub contains {
-    my ($self, $bytestream) = @_;
-    my ($buffer, $window);
+  my ($self, $string) = @_;
 
-    # Seek to start
-    $self->handle->sysseek($self->start_range, SEEK_SET);
-    my $end = defined $self->end_range ? $self->end_range : $self->size;
-    my $rlen = length($bytestream) * 2;
-    if ($rlen > $end - $self->start_range) {
-        $rlen = $end - $self->start_range;
-    }
+  # Seek to start
+  my $handle = $self->handle;
+  $handle->sysseek($self->start_range, SEEK_SET);
 
-    # Read
-    my $read    = $self->handle->sysread($window, $rlen);
-    my $offset  = $read;
-    my $readlen = length($bytestream);
+  # Calculate window size
+  my $end  = $self->end_range // $self->size;
+  my $len  = length $string;
+  my $size = $len > 131072 ? $len : 131072;
+  $size = $end - $self->start_range if $size > $end - $self->start_range;
 
-    # Moving window search
-    my $range = $self->end_range;
-    while ($offset <= $end) {
-        if (defined $range) {
-            $readlen = $end + 1 - $offset;
-            return -1 if $readlen <= 0;
-        }
-        $read = $self->handle->sysread($buffer, $readlen);
-        $offset += $read;
-        $window .= $buffer;
-        my $pos = index $window, $bytestream;
-        return $pos if $pos >= 0;
-        return -1   if $read == 0;
-        substr $window, 0, $read, '';
-    }
+  # Sliding window search
+  my $offset = 0;
+  my $start = $handle->sysread(my $window, $len);
+  while ($offset < $end) {
 
-    return -1;
+    # Read as much as possible
+    my $diff = $end - ($start + $offset);
+    my $read = $handle->sysread(my $buffer, $diff < $size ? $diff : $size);
+    $window .= $buffer;
+
+    # Search window
+    my $pos = index $window, $string;
+    return $offset + $pos if $pos >= 0;
+    $offset += $read;
+    return -1 if $read == 0 || $offset == $end;
+
+    # Resize window
+    substr $window, 0, $read, '';
+  }
+
+  return -1;
 }
 
 sub get_chunk {
-    my ($self, $offset) = @_;
+  my ($self, $start) = @_;
 
-    # Seek to start
-    my $off = $offset + $self->start_range;
-    $self->handle->sysseek($off, SEEK_SET);
-    my $end = $self->end_range;
-    my $buffer;
+  # Seek to start
+  $start += $self->start_range;
+  my $handle = $self->handle;
+  $handle->sysseek($start, SEEK_SET);
 
-    # Chunk size
-    my $size = $ENV{MOJO_CHUNK_SIZE} || 262144;
+  # Range support
+  my $buffer;
+  if (defined(my $end = $self->end_range)) {
+    my $chunk = $end + 1 - $start;
+    return '' if $chunk <= 0;
+    $handle->sysread($buffer, $chunk > 131072 ? 131072 : $chunk);
+  }
+  else { $handle->sysread($buffer, 131072) }
 
-    # Range support
-    if (defined $end) {
-        my $chunk = $end + 1 - $off;
-        return '' if $chunk <= 0;
-        $chunk = $size if $chunk > $size;
-        $self->handle->sysread($buffer, $chunk);
-    }
-    else { $self->handle->sysread($buffer, $size) }
-
-    return $buffer;
+  return $buffer;
 }
 
+sub is_file {1}
+
 sub move_to {
-    my ($self, $path) = @_;
-    my $src = $self->path;
+  my ($self, $to) = @_;
 
-    # Close handle
-    close $self->handle;
-    $self->handle(undef);
+  # Windows requires that the handle is closed
+  close $self->handle;
+  delete $self->{handle};
 
-    # Move
-    File::Copy::move($src, $path)
-      or croak qq/Can't move file "$src" to "$path": $!/;
-
-    # Set new path
-    $self->path($path);
-
-    # Don't clean up a moved file
-    $self->cleanup(0);
-
-    return $self;
+  # Move file and prevent clean up
+  my $from = $self->path;
+  move($from, $to) or croak qq{Can't move file "$from" to "$to": $!};
+  return $self->path($to)->cleanup(0);
 }
 
 sub size {
-    my $self = shift;
-
-    # File size
-    my $file = $self->path;
-    return -s $file if $file;
-
-    return 0;
+  return 0 unless defined(my $file = shift->path);
+  return -s $file;
 }
 
 sub slurp {
-    my $self = shift;
-
-    # Seek to start
-    $self->handle->sysseek(0, SEEK_SET);
-
-    # Slurp
-    my $content = '';
-    while ($self->handle->sysread(my $buffer, 262144)) { $content .= $buffer }
-
-    return $content;
+  my $handle = shift->handle;
+  $handle->sysseek(0, SEEK_SET);
+  my $content = '';
+  while ($handle->sysread(my $buffer, 131072)) { $content .= $buffer }
+  return $content;
 }
 
 1;
-__END__
 
 =head1 NAME
 
-Mojo::Asset::File - File Asset
+Mojo::Asset::File - File storage for HTTP content
 
 =head1 SYNOPSIS
 
-    use Mojo::Asset::File;
+  use Mojo::Asset::File;
 
-    my $asset = Mojo::Asset::File->new;
-    $asset->add_chunk('foo bar baz');
-    print $asset->slurp;
+  # Temporary file
+  my $file = Mojo::Asset::File->new;
+  $file->add_chunk('foo bar baz');
+  say 'File contains "bar"' if $file->contains('bar') >= 0;
+  say $file->slurp;
 
-    my $asset = Mojo::Asset::File->new(path => '/foo/bar/baz.txt');
-    print $asset->slurp;
+  # Existing file
+  my $file = Mojo::Asset::File->new(path => '/home/sri/foo.txt');
+  $file->move_to('/yada.txt');
+  say $file->slurp;
 
 =head1 DESCRIPTION
 
-L<Mojo::Asset::File> is a container for file assets.
+L<Mojo::Asset::File> is a file storage backend for HTTP content.
+
+=head1 EVENTS
+
+L<Mojo::Asset::File> inherits all events from L<Mojo::Asset>.
 
 =head1 ATTRIBUTES
 
-L<Mojo::Asset::File> implements the following attributes.
+L<Mojo::Asset::File> inherits all attributes from L<Mojo::Asset> and
+implements the following new ones.
 
-=head2 C<cleanup>
+=head2 cleanup
 
-    my $cleanup = $asset->cleanup;
-    $asset      = $asset->cleanup(1);
+  my $cleanup = $file->cleanup;
+  $file       = $file->cleanup(1);
 
 Delete file automatically once it's not used anymore.
 
-=head2 C<handle>
+=head2 handle
 
-    my $handle = $asset->handle;
-    $asset     = $asset->handle(IO::File->new);
+  my $handle = $file->handle;
+  $file      = $file->handle(IO::File->new);
 
-Actual file handle.
+File handle, created on demand.
 
-=head2 C<path>
+=head2 path
 
-    my $path = $asset->path;
-    $asset   = $asset->path('/foo/bar/baz.txt');
+  my $path = $file->path;
+  $file    = $file->path('/home/sri/foo.txt');
 
-Actual file path.
+File path used to create C<handle>, can also be automatically generated if
+necessary.
 
-=head2 C<tmpdir>
+=head2 tmpdir
 
-    my $tmpdir = $asset->tmpdir;
-    $asset     = $asset->tmpdir('/tmp');
+  my $tmpdir = $file->tmpdir;
+  $file      = $file->tmpdir('/tmp');
 
-Temporary directory.
+Temporary directory used to generate C<path>, defaults to the value of the
+C<MOJO_TMPDIR> environment variable or auto detection.
 
 =head1 METHODS
 
 L<Mojo::Asset::File> inherits all methods from L<Mojo::Asset> and implements
 the following new ones.
 
-=head2 C<add_chunk>
+=head2 add_chunk
 
-    $asset = $asset->add_chunk('foo bar baz');
+  $file = $file->add_chunk('foo bar baz');
 
-Add chunk of data to asset.
+Add chunk of data.
 
-=head2 C<contains>
+=head2 contains
 
-    my $position = $asset->contains('bar');
+  my $position = $file->contains('bar');
 
 Check if asset contains a specific string.
 
-=head2 C<get_chunk>
+=head2 get_chunk
 
-    my $chunk = $asset->get_chunk($offset);
+  my $chunk = $file->get_chunk($start);
 
 Get chunk of data starting from a specific position.
 
-=head2 C<move_to>
+=head2 is_file
 
-    $asset = $asset->move_to('/foo/bar/baz.txt');
+  my $true = $file->is_file;
 
-Move asset data into a specific file.
+True.
 
-=head2 C<size>
+=head2 move_to
 
-    my $size = $asset->size;
+  $file = $file->move_to('/home/sri/bar.txt');
+
+Move asset data into a specific file and disable C<cleanup>.
+
+=head2 size
+
+  my $size = $file->size;
 
 Size of asset data in bytes.
 
-=head2 C<slurp>
+=head2 slurp
 
-    my $string = $file->slurp;
+  my $string = $file->slurp;
 
 Read all asset data at once.
 
 =head1 SEE ALSO
 
-L<Mojolicious>, L<Mojolicious::Guides>, L<http://mojolicious.org>.
+L<Mojolicious>, L<Mojolicious::Guides>, L<http://mojolicio.us>.
 
 =cut

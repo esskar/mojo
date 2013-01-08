@@ -1,46 +1,47 @@
 package Mojolicious::Plugin;
+use Mojo::Base -base;
 
-use strict;
-use warnings;
+use Carp 'croak';
 
-use base 'Mojo::Base';
-
-# This is Fry's decision.
-# And he made it wrong, so it's time for us to interfere in his life.
-sub register { }
+sub register { croak 'Method "register" not implemented by subclass' }
 
 1;
-__END__
 
 =head1 NAME
 
-Mojolicious::Plugin - Plugin Base Class
+Mojolicious::Plugin - Plugin base class
 
 =head1 SYNOPSIS
 
-    use base 'Mojolicious::Plugin';
+  # Camel case plugin name
+  package Mojolicious::Plugin::MyPlugin;
+  use Mojo::Base 'Mojolicious::Plugin';
+
+  sub register {
+    my ($self, $app, $conf) = @_;
+
+    # Magic here! :)
+  }
 
 =head1 DESCRIPTION
 
-L<Mojolicous::Plugin> is an abstract base class for L<Mojolicious> plugins.
-See L<Mojolicious::Plugins> for more information.
+L<Mojolicious::Plugin> is an abstract base class for L<Mojolicious> plugins.
 
 =head1 METHODS
 
 L<Mojolicious::Plugin> inherits all methods from L<Mojo::Base> and implements
 the following new ones.
 
-=head2 C<register>
+=head2 register
 
-    $plugin->register;
-    
-This method will be called by L<Mojolicious::Plugins> at startup time,
-your plugin should use this to hook into the application.
-For instace by adding handlers and helpers to the renderer or using the
-C<add_hooks> method of L<Mojolicious::Plugins> to hook into the request flow.
+  $plugin->register(Mojolicious->new);
+  $plugin->register(Mojolicious->new, {foo => 'bar'});
+
+This method will be called by L<Mojolicious::Plugins> at startup time. Meant
+to be overloaded in a subclass.
 
 =head1 SEE ALSO
 
-L<Mojolicious>, L<Mojolicious::Guides>, L<http://mojolicious.org>.
+L<Mojolicious>, L<Mojolicious::Guides>, L<http://mojolicio.us>.
 
 =cut

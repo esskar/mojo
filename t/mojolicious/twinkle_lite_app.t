@@ -1,50 +1,58 @@
-#!/usr/bin/env perl
+use Mojo::Base -strict;
 
-use strict;
-use warnings;
+# Disable IPv6 and libev
+BEGIN {
+  $ENV{MOJO_NO_IPV6} = 1;
+  $ENV{MOJO_REACTOR} = 'Mojo::Reactor::Poll';
+}
 
-# Disable epoll, kqueue and IPv6
-BEGIN { $ENV{MOJO_POLL} = $ENV{MOJO_NO_IPV6} = 1 }
-
-use Mojo::IOLoop;
 use Test::More;
-
-# Make sure sockets are working
-plan skip_all => 'working sockets required for this test!'
-  unless Mojo::IOLoop->new->generate_port;
-plan skip_all => 'Perl 5.10 required for this test!'
-  unless eval { require Pod::Simple::HTML; 1 };
-plan tests => 17;
-
-# Pizza delivery for...
-# I. C. Weiner. Aww... I always thought by this stage in my life I'd be the
-# one making the crank calls.
 use Mojolicious::Lite;
+use Mojo::Util;
 use Test::Mojo;
 
-# Silence
-app->log->level('error');
+# Custom format
+app->renderer->default_format('foo');
 
 # Twinkle template syntax
 my $twinkle = {
-    capture_end     => '.',
-    capture_start   => '+',
-    escape_mark     => '*',
-    expression_mark => '*',
-    line_start      => '**',
-    tag_end         => '**',
-    tag_start       => '**',
-    trim_mark       => '*'
+  append          => '$self->res->headers->header("X-Append" => $prepended);',
+  auto_escape     => 0,
+  capture_end     => '-',
+  capture_start   => '+',
+  escape          => \&Mojo::Util::html_escape,
+  escape_mark     => '*',
+  expression_mark => '*',
+  line_start      => '.',
+  namespace       => 'TwinkleSandBoxTest',
+  prepend         => 'my $prepended = $self->config("foo");',
+  tag_end         => '**',
+  tag_start       => '**',
+  trim_mark       => '*'
 };
 
-# Plugins
-plugin ep_renderer => {name => 'twinkle', template => $twinkle};
-plugin 'pod_renderer';
-plugin pod_renderer => {name => 'teapod', preprocess => 'twinkle'};
-my $config = plugin json_config =>
-  {default => {foo => 'bar'}, ext => 'conf', template => $twinkle};
-is($config->{foo},  'bar', 'right value');
-is($config->{test}, 23,    'right value');
+# Renderer
+plugin EPRenderer => {name => 'twinkle', template => $twinkle};
+plugin 'PODRenderer', no_perldoc => 1;
+plugin 'PODRenderer',
+  name       => 'teapod',
+  preprocess => 'twinkle',
+  no_perldoc => 1;
+
+# Configuration
+app->defaults(foo_test => 23);
+my $config = plugin JSONConfig => {
+  default  => {foo => 'bar'},
+  ext      => 'conf',
+  template => {
+    %$twinkle,
+    append  => '$app->defaults(foo_test => 24)',
+    prepend => 'my $foo = app->defaults("foo_test");'
+  }
+};
+is $config->{foo},  'bar', 'right value';
+is $config->{test}, 23,    'right value';
+is app->defaults('foo_test'), 24, 'right value';
 
 # GET /
 get '/' => {name => '<sebastian>'} => 'index';
@@ -61,43 +69,76 @@ get '/docs2' => {codename => 'snowman'} => 'docs2';
 # GET /docs3
 get '/docs3' => sub { shift->stash(codename => undef) } => 'docs';
 
+# GET /rest
+get '/rest' => sub {
+  shift->respond_to(
+    foo  => {text => 'foo works!'},
+    html => {text => 'html works!'}
+  );
+};
+
+# GET /dead
+get '/dead' => sub {die};
+
 my $t = Test::Mojo->new;
 
 # GET /
-$t->get_ok('/')->status_is(200)->content_like(qr/testHello <sebastian>!123/);
+$t->get_ok('/')->status_is(200)->header_is('X-Append' => 'bar')
+  ->content_like(qr/testHello <sebastian>!bar TwinkleSandBoxTest123/);
 
 # GET /advanced
-$t->get_ok('/advanced')->status_is(200)
-  ->content_is('&lt;escape me&gt;123423');
+$t->get_ok('/advanced')->status_is(200)->header_is('X-Append' => 'bar')
+  ->content_is("&lt;escape me&gt;&awconint;\n123423");
 
 # GET /docs
-$t->get_ok('/docs')->status_is(200)->content_like(qr/<h3>snowman<\/h3>/);
+$t->get_ok('/docs')->status_is(200)->content_like(qr!<h3>snowman</h3>!);
 
 # GET /docs2
-$t->get_ok('/docs2')->status_is(200)->content_like(qr/<h2>snowman<\/h2>/);
+$t->get_ok('/docs2')->status_is(200)->content_like(qr!<h2>snowman</h2>!);
 
 # GET /docs3
-$t->get_ok('/docs3')->status_is(200)->content_like(qr/<h3><\/h3>/);
+$t->get_ok('/docs3')->status_is(200)->content_like(qr!<h3></h3>!);
+
+# GET /rest (foo format)
+$t->get_ok('/rest')->status_is(200)->content_is('foo works!');
+
+# GET /rest.html (html format)
+$t->get_ok('/rest.html')->status_is(200)->content_is('html works!');
+
+# GET /perldoc (disabled)
+$t->get_ok('/perldoc')->status_is(404)->content_is("foo not found!\n");
+
+# GET /dead (exception template with custom format)
+$t->get_ok('/dead')->status_is(500)->content_is("foo exception!\n");
+
+done_testing();
 
 __DATA__
-@@ index.html.twinkle
-** layout 'twinkle';
-Hello **** $name **!\
+@@ index.foo.twinkle
+. layout 'twinkle';
+Hello *** $name **!\
+*** $prepended ** *** __PACKAGE__ **\
 
-@@ layouts/twinkle.html.ep
+@@ layouts/twinkle.foo.ep
 test<%= content %>123\
 
-@@ advanced.html.twinkle
-*** '<escape me>'
-** my $numbers = [1 .. 4];
+@@ advanced.foo.twinkle
+.** "<escape me>\x{2233}"
+. my $numbers = [1 .. 4];
  ** for my $i (@$numbers) { ***
  *** $i ***
  ** } ***
- ** my $foo = filter +*** 23 **.*** *** $foo ***
+ ** my $foo = (+*** 23 **-)->();*** *** $foo ***
 
-@@ docs.html.pod
+@@ docs.foo.pod
 % no warnings;
 <%= '=head3 ' . $codename %>
 
-@@ docs2.html.teapod
-*** '=head2 ' . $codename
+@@ docs2.foo.teapod
+.** '=head2 ' . $codename
+
+@@ exception.foo.ep
+foo exception!
+
+@@ not_found.foo.ep
+foo not found!

@@ -1,606 +1,480 @@
 package Mojo::Server::Daemon;
-
-use strict;
-use warnings;
-
-use base 'Mojo::Server';
+use Mojo::Base 'Mojo::Server';
 
 use Carp 'croak';
-use File::Spec;
-use IO::File;
-use Mojo::Command;
 use Mojo::IOLoop;
+use Mojo::URL;
+use POSIX;
 use Scalar::Util 'weaken';
-use Sys::Hostname;
 
-# Bonjour
-use constant BONJOUR => $ENV{MOJO_NO_BONJOUR}
-  ? 0
-  : eval 'use Net::Rendezvous::Publish 0.04 (); 1';
-
-# Debug
 use constant DEBUG => $ENV{MOJO_DAEMON_DEBUG} || 0;
 
-__PACKAGE__->attr(
-    [qw/group listen listen_queue_size max_requests silent user/]);
-__PACKAGE__->attr(ioloop => sub { Mojo::IOLoop->singleton });
-__PACKAGE__->attr(keep_alive_timeout      => 5);
-__PACKAGE__->attr(max_clients             => 1000);
-__PACKAGE__->attr(max_keep_alive_requests => 100);
-__PACKAGE__->attr(
-    pid_file => sub {
-        my $self = shift;
-        return File::Spec->catfile($ENV{MOJO_TMPDIR} || File::Spec->tmpdir,
-            Mojo::Command->class_to_file(ref $self->app) . '.pid');
-    }
-);
-__PACKAGE__->attr(websocket_timeout => 300);
+has [qw(backlog group silent user)];
+has inactivity_timeout => sub { $ENV{MOJO_INACTIVITY_TIMEOUT} // 15 };
+has ioloop => sub { Mojo::IOLoop->singleton };
+has listen => sub { [split /,/, $ENV{MOJO_LISTEN} || 'http://*:3000'] };
+has max_clients  => 1000;
+has max_requests => 25;
 
 sub DESTROY {
-    my $self = shift;
-
-    # Shortcut
-    return unless my $loop = $self->ioloop;
-
-    # Cleanup connections
-    my $cs = $self->{_cs} || {};
-    for my $id (keys %$cs) { $loop->drop($id) }
-
-    # Cleanup listen sockets
-    return unless my $listen = $self->{_listen};
-    for my $id (@$listen) { $loop->drop($id) }
+  my $self = shift;
+  return unless my $loop = $self->ioloop;
+  $self->_remove($_) for keys %{$self->{connections} || {}};
+  $loop->remove($_) for @{$self->{acceptors} || []};
 }
 
-sub prepare_ioloop {
-    my $self = shift;
-
-    # Loop
-    my $loop = $self->ioloop;
-
-    # Signals
-    $SIG{HUP} = sub {
-        $loop->max_connections(0)
-          and $self->app->log->info('Graceful shutdown.');
-      }
-      if $^O ne 'MSWin32';
-
-    # Listen
-    my $listen = $self->listen || 'http://*:3000';
-    $self->_listen($_) for split ',', $listen;
-
-    # Max clients
-    $loop->max_connections($self->max_clients);
-}
-
-sub prepare_pid_file {
-    my $self = shift;
-
-    return unless my $file = $self->pid_file;
-
-    # PID file
-    my $fh;
-    if (-e $file) {
-        $fh = IO::File->new("< $file")
-          or croak qq/Can't open PID file "$file": $!/;
-        my $pid = <$fh>;
-        warn "Server already running with PID $pid.\n" if kill 0, $pid;
-        warn qq/Can't unlink PID file "$file".\n/
-          unless -w $file && unlink $file;
-    }
-
-    # Create new PID file
-    $fh = IO::File->new($file, O_WRONLY | O_CREAT | O_EXCL, 0644)
-      or croak qq/Can't create PID file "$file"/;
-
-    # PID
-    print $fh $$;
-    close $fh;
-
-    # Signals
-    $SIG{INT} = $SIG{TERM} = sub {
-
-        # Remove PID file
-        unlink $self->pid_file;
-
-        # Done
-        exit 0;
-    };
-}
-
-# 40 dollars!? This better be the best damn beer ever..
-# *drinks beer* You got lucky.
 sub run {
-    my $self = shift;
+  my $self = shift;
 
-    # Prepare ioloop
-    $self->prepare_ioloop;
+  # Signals
+  $SIG{INT} = $SIG{TERM} = sub { exit 0 };
 
-    # User and group
-    $self->setuidgid;
-
-    # Prepare PID file
-    $self->prepare_pid_file;
-
-    # Start loop
-    $self->ioloop->start;
+  # Change user/group and start accepting connections
+  $self->start->setuidgid->ioloop->start;
 }
 
 sub setuidgid {
-    my $self = shift;
+  my $self = shift;
 
-    # Group
-    if (my $group = $self->group) {
-        if (my $gid = (getgrnam($group))[2]) {
+  # Group
+  if (my $group = $self->group) {
+    croak qq{Group "$group" does not exist}
+      unless defined(my $gid = (getgrnam($group))[2]);
+    POSIX::setgid($gid) or croak qq{Can't switch to group "$group": $!};
+  }
 
-            # Cleanup
-            undef $!;
+  # User
+  if (my $user = $self->user) {
+    croak qq{User "$user" does not exist}
+      unless defined(my $uid = (getpwnam($self->user))[2]);
+    POSIX::setuid($uid) or croak qq{Can't switch to user "$user": $!};
+  }
 
-            # Switch
-            $) = $gid;
-            croak qq/Can't switch to effective group "$group": $!/ if $!;
-        }
-    }
+  return $self;
+}
 
-    # User
-    if (my $user = $self->user) {
-        if (my $uid = (getpwnam($user))[2]) {
+sub start {
+  my $self = shift;
 
-            # Cleanup
-            undef $!;
+  # Resume accepting connections
+  my $loop = $self->ioloop;
+  if (my $acceptors = $self->{acceptors}) {
+    push @$acceptors, $loop->acceptor(delete $self->{servers}{$_})
+      for keys %{$self->{servers}};
+  }
 
-            # Switch
-            $> = $uid;
-            croak qq/Can't switch to effective user "$user": $!/ if $!;
-        }
-    }
+  # Start listening
+  else { $self->_listen($_) for @{$self->listen} }
+  $loop->max_connections($self->max_clients);
 
-    return $self;
+  return $self;
+}
+
+sub stop {
+  my $self = shift;
+
+  # Pause accepting connections
+  my $loop = $self->ioloop;
+  while (my $id = shift @{$self->{acceptors}}) {
+    my $server = $self->{servers}{$id} = $loop->acceptor($id);
+    $loop->remove($id);
+    $server->stop;
+  }
+
+  return $self;
 }
 
 sub _build_tx {
-    my ($self, $id, $c) = @_;
+  my ($self, $id, $c) = @_;
 
-    # Build transaction
-    my $tx = $self->build_tx_cb->($self);
+  # Build transaction
+  my $tx = $self->build_tx->connection($id);
 
-    # Identify
-    $tx->res->headers->server('Mojolicious (Perl)');
+  # Identify
+  $tx->res->headers->server('Mojolicious (Perl)');
 
-    # Connection
-    $tx->connection($id);
+  # Store connection information
+  my $handle = $self->ioloop->stream($id)->handle;
+  $tx->local_address($handle->sockhost)->local_port($handle->sockport);
+  $tx->remote_address($handle->peerhost)->remote_port($handle->peerport);
 
-    # Store connection information
-    my $loop  = $self->ioloop;
-    my $local = $loop->local_info($id);
-    $tx->local_address($local->{address} || '127.0.0.1');
-    $tx->local_port($local->{port});
-    my $remote = $loop->remote_info($id);
-    $tx->remote_address($remote->{address} || '127.0.0.1');
-    $tx->remote_port($remote->{port});
+  # TLS
+  $tx->req->url->base->scheme('https') if $c->{tls};
 
-    # TLS
-    $tx->req->url->base->scheme('https') if $c->{tls};
-
-    # Weaken
-    weaken $self;
-
-    # Handler callback
-    $tx->handler_cb(
-        sub {
-            my $tx = shift;
-
-            # Handler
-            $self->handler_cb->($self, $tx);
-
-            # Resume callback
-            $tx->resume_cb(sub { $self->_write($id) });
-        }
-    );
-
-    # Upgrade callback
-    $tx->upgrade_cb(sub { $self->_upgrade($id, @_) });
-
-    # New request on the connection
-    $c->{requests} ||= 0;
-    $c->{requests}++;
-
-    # Request limit
-    if (my $max = $self->max_requests) {
-        $self->{_requests} ||= 0;
-        if (++$self->{_requests} >= $max) {
-            for my $id (@{$self->{_listen}}) { $loop->drop($id) }
-            $self->max_keep_alive_requests(1);
-            $self->ioloop->max_connections(0);
-        }
+  # Handle upgrades and requests
+  weaken $self;
+  $tx->on(
+    upgrade => sub {
+      my ($tx, $ws) = @_;
+      $ws->server_handshake;
+      $self->{connections}{$id}{ws} = $ws;
     }
+  );
+  $tx->on(
+    request => sub {
+      my $tx = shift;
+      $self->emit(request => $self->{connections}{$id}{ws} || $tx);
+      $tx->on(resume => sub { $self->_write($id) });
+    }
+  );
 
-    # Kept alive if we have more than one request on the connection
-    $tx->kept_alive(1) if $c->{requests} > 1;
+  # Kept alive if we have more than one request on the connection
+  $tx->kept_alive(1) if ++$c->{requests} > 1;
 
-    return $tx;
+  return $tx;
 }
 
-sub _drop {
-    my ($self, $id) = @_;
+sub _close {
+  my ($self, $id) = @_;
 
-    # WebSocket
-    if (my $ws = $self->{_cs}->{$id}->{websocket}) { $ws->server_close }
+  # Finish gracefully
+  if (my $tx = $self->{connections}{$id}{tx}) { $tx->server_close }
 
-    # Drop connection
-    delete $self->{_cs}->{$id};
-}
-
-sub _error {
-    my ($self, $loop, $id, $error) = @_;
-
-    # Log
-    $self->app->log->error($error);
-
-    # Drop
-    $self->_drop($id);
+  # Remove connection
+  delete $self->{connections}{$id};
 }
 
 sub _finish {
-    my ($self, $id, $tx) = @_;
+  my ($self, $id, $tx) = @_;
 
-    # WebSocket
-    if ($tx->is_websocket) {
-        $self->_drop($id);
-        return $self->ioloop->drop($id);
+  # Always remove connection for WebSockets
+  return $self->_remove($id) if $tx->is_websocket;
+
+  # Finish transaction
+  $tx->server_close;
+
+  # Upgrade connection to WebSocket
+  my $c = $self->{connections}{$id};
+  if (my $ws = $c->{tx} = delete $c->{ws}) {
+
+    # Successful upgrade
+    if ($ws->res->code eq '101') {
+      weaken $self;
+      $ws->on(resume => sub { $self->_write($id) });
     }
 
-    # Connection
-    my $c = $self->{_cs}->{$id};
-
-    # Finish transaction
-    delete $c->{transaction};
-    $tx->server_close;
-
-    # WebSocket
-    my $s = 0;
-    if (my $ws = $c->{websocket}) {
-
-        # Successful upgrade
-        if ($ws->res->code eq '101') {
-
-            # Make sure connection stays active
-            $tx->keep_alive(1);
-
-            # Weaken
-            weaken $self;
-
-            # Resume callback
-            $ws->resume_cb(sub { $self->_write($id) });
-        }
-
-        # Failed upgrade
-        else {
-            delete $c->{websocket};
-            $ws->server_close;
-        }
+    # Failed upgrade
+    else {
+      delete $c->{tx};
+      $ws->server_close;
     }
+  }
 
-    # Close connection
-    if ($tx->req->error || !$tx->keep_alive) {
-        $self->_drop($id);
-        $self->ioloop->drop($id);
-    }
+  # Close connection if necessary
+  my $req = $tx->req;
+  return $self->_remove($id) if $req->error || !$tx->keep_alive;
 
-    # Leftovers
-    elsif (defined(my $leftovers = $tx->server_leftovers)) {
-        $tx = $c->{transaction} = $self->_build_tx($id, $c);
-        $tx->server_read($leftovers);
-    }
-}
-
-sub _hup {
-    my ($self, $loop, $id) = @_;
-
-    # Drop
-    $self->_drop($id);
+  # Build new transaction for leftovers
+  return unless $req->has_leftovers;
+  $tx = $c->{tx} = $self->_build_tx($id, $c);
+  $tx->server_read($req->leftovers);
 }
 
 sub _listen {
-    my ($self, $listen) = @_;
+  my ($self, $listen) = @_;
 
-    # Shortcut
-    return unless $listen;
+  # Options
+  my $url     = Mojo::URL->new($listen);
+  my $query   = $url->query;
+  my $options = {
+    address  => $url->host,
+    backlog  => $self->backlog,
+    port     => $url->port,
+    tls_ca   => scalar $query->param('ca'),
+    tls_cert => scalar $query->param('cert'),
+    tls_key  => scalar $query->param('key')
+  };
+  my $verify = $query->param('verify');
+  $options->{tls_verify} = hex $verify if defined $verify;
+  delete $options->{address} if $options->{address} eq '*';
+  my $tls = $options->{tls} = $url->protocol eq 'https' ? 1 : undef;
 
-    # Options
-    my $options = {};
+  # Listen
+  weaken $self;
+  my $id = $self->ioloop->server(
+    $options => sub {
+      my ($loop, $stream, $id) = @_;
 
-    # UNIX domain socket
-    if ($listen =~ /^file\:\/\/(.+)$/) { unlink $options->{file} = $1 }
+      # Add new connection
+      my $c = $self->{connections}{$id} = {tls => $tls};
+      warn "-- Accept (@{[$stream->handle->peerhost]})\n" if DEBUG;
 
-    # Internet socket
-    elsif ($listen =~ /^(http(?:s)?)\:\/\/(.+)\:(\d+)(?:\:(.*)\:(.*))?$/) {
-        $options->{tls} = 1 if $1 eq 'https';
-        $options->{address}  = $2 if $2 ne '*';
-        $options->{port}     = $3;
-        $options->{tls_cert} = $4 if $4;
-        $options->{tls_key}  = $5 if $5;
+      # Inactivity timeout
+      $stream->timeout($self->inactivity_timeout);
+
+      # Events
+      $stream->on(close => sub { $self->_close($id) });
+      $stream->on(
+        error => sub {
+          return unless $self;
+          $self->app->log->error(pop);
+          $self->_close($id);
+        }
+      );
+      $stream->on(read => sub { $self->_read($id => pop) });
+      $stream->on(timeout =>
+          sub { $self->app->log->debug('Inactivity timeout.') if $c->{tx} });
     }
+  );
+  push @{$self->{acceptors} ||= []}, $id;
 
-    # Listen queue size
-    my $queue = $self->listen_queue_size;
-    $options->{queue_size} = $queue if $queue;
-
-    # Weaken
-    weaken $self;
-
-    # Callbacks
-    $options->{accept_cb} = sub {
-        my ($loop, $id) = @_;
-
-        # Add new connection
-        $self->{_cs}->{$id} = {tls => $options->{tls} ? 1 : 0};
-
-        # Keep alive timeout
-        $loop->connection_timeout($id => $self->keep_alive_timeout);
-    };
-    $options->{error_cb} = sub { $self->_error(@_) };
-    $options->{hup_cb}   = sub { $self->_hup(@_) };
-    $options->{read_cb}  = sub { $self->_read(@_) };
-
-    # Listen
-    my $id = $self->ioloop->listen($options);
-    $self->{_listen} ||= [];
-    push @{$self->{_listen}}, $id;
-
-    # Bonjour
-    if (BONJOUR && (my $p = Net::Rendezvous::Publish->new)) {
-        my $port = $options->{port};
-        my $name = $options->{address} || Sys::Hostname::hostname();
-        $p->publish(
-            name   => "Mojolicious ($name:$port)",
-            type   => '_http._tcp',
-            domain => 'local',
-            port   => $port
-        ) if $port && !$options->{tls};
-    }
-
-    # Log
-    $self->app->log->info("Server listening ($listen)");
-
-    # Friendly message
-    print "Server available at $listen.\n" unless $self->silent;
+  # Friendly message
+  return if $self->silent;
+  $self->app->log->info(qq{Listening at "$listen".});
+  $listen =~ s!//\*!//127.0.0.1!i;
+  say "Server available at $listen.";
 }
 
 sub _read {
-    my ($self, $loop, $id, $chunk) = @_;
+  my ($self, $id, $chunk) = @_;
 
-    # Debug
-    warn "< $chunk\n" if DEBUG;
+  # Make sure we have a transaction
+  my $c = $self->{connections}{$id};
+  my $tx = $c->{tx} ||= $self->_build_tx($id, $c);
 
-    # Connection
-    my $c = $self->{_cs}->{$id};
+  # Parse chunk
+  warn "-- Server <<< Client (@{[$tx->req->url->to_abs]})\n$chunk\n" if DEBUG;
+  $tx->server_read($chunk);
 
-    # Transaction
-    my $tx = $c->{transaction} || $c->{websocket};
+  # Last keep alive request or corrupted connection
+  $tx->res->headers->connection('close')
+    if (($c->{requests} || 0) >= $self->max_requests) || $tx->req->error;
 
-    # New transaction
-    $tx = $c->{transaction} = $self->_build_tx($id, $c) unless $tx;
-
-    # Read
-    $tx->server_read($chunk);
-
-    # Last keep alive request
-    $tx->res->headers->connection('Close')
-      if ($c->{requests} || 0) >= $self->max_keep_alive_requests;
-
-    # Finish
-    if ($tx->is_done) { $self->_finish($id, $tx) }
-
-    # Writing
-    elsif ($tx->is_writing) { $self->_write($id) }
+  # Finish or start writing
+  if ($tx->is_finished) { $self->_finish($id, $tx) }
+  elsif ($tx->is_writing) { $self->_write($id) }
 }
 
-sub _upgrade {
-    my ($self, $id, $tx) = @_;
-
-    # WebSocket
-    return unless $tx->req->headers->upgrade =~ /WebSocket/i;
-
-    # Connection
-    my $c = $self->{_cs}->{$id};
-
-    # WebSocket handshake handler
-    my $ws = $c->{websocket} = $self->websocket_handshake_cb->($self, $tx);
-
-    # Upgrade connection timeout
-    $self->ioloop->connection_timeout($id, $self->websocket_timeout);
-
-    # Not resumable yet
-    $ws->resume_cb(sub {1});
+sub _remove {
+  my ($self, $id) = @_;
+  $self->ioloop->remove($id);
+  $self->_close($id);
 }
 
 sub _write {
-    my ($self, $id) = @_;
+  my ($self, $id) = @_;
 
-    # Connection
-    my $c = $self->{_cs}->{$id};
+  # Not writing
+  my $c = $self->{connections}{$id};
+  return unless my $tx = $c->{tx};
+  return unless $tx->is_writing;
 
-    # Transaction
-    return unless my $tx = $c->{transaction} || $c->{websocket};
+  # Get chunk
+  return if $c->{writing}++;
+  my $chunk = $tx->server_write;
+  delete $c->{writing};
+  warn "-- Server >>> Client (@{[$tx->req->url->to_abs]})\n$chunk\n" if DEBUG;
 
-    # Not writing
-    return unless $tx->is_writing;
+  # Write chunk
+  my $stream = $self->ioloop->stream($id)->write($chunk);
 
-    # Get chunk
-    my $chunk = $tx->server_write;
-
-    # Weaken
-    weaken $self;
-
-    # Callback
-    my $cb = sub { $self->_write($id) };
-
-    # Done
-    if ($tx->is_done) {
-
-        # Finish
-        $self->_finish($id, $tx);
-
-        # No followup
-        $cb = undef unless $c->{transaction} || $c->{websocket};
+  # Finish or continue writing
+  weaken $self;
+  my $cb = sub { $self->_write($id) };
+  if ($tx->is_finished) {
+    if ($tx->has_subscribers('finish')) {
+      $cb = sub { $self->_finish($id, $tx) }
     }
-
-    # Not writing
-    elsif (!$tx->is_writing) { $cb = undef }
-
-    # Write
-    $self->ioloop->write($id, $chunk, $cb);
-
-    # Debug
-    warn "> $chunk\n" if DEBUG;
+    else {
+      $self->_finish($id, $tx);
+      return unless $c->{tx};
+    }
+  }
+  $stream->write('', $cb);
 }
 
 1;
-__END__
 
 =head1 NAME
 
-Mojo::Server::Daemon - Async IO HTTP 1.1 And WebSocket Server
+Mojo::Server::Daemon - Non-blocking I/O HTTP and WebSocket server
 
 =head1 SYNOPSIS
 
-    use Mojo::Server::Daemon;
+  use Mojo::Server::Daemon;
 
-    my $daemon = Mojo::Server::Daemon->new;
-    $daemon->listen('http://*:8080');
-    $daemon->run;
+  my $daemon = Mojo::Server::Daemon->new(listen => ['http://*:8080']);
+  $daemon->unsubscribe('request');
+  $daemon->on(request => sub {
+    my ($daemon, $tx) = @_;
+
+    # Request
+    my $method = $tx->req->method;
+    my $path   = $tx->req->url->path;
+
+    # Response
+    $tx->res->code(200);
+    $tx->res->headers->content_type('text/plain');
+    $tx->res->body("$method request for $path!");
+
+    # Resume transaction
+    $tx->resume;
+  });
+  $daemon->run;
 
 =head1 DESCRIPTION
 
-L<Mojo::Server::Daemon> is a full featured async io HTTP 1.1 and WebSocket
-server with C<IPv6>, C<TLS>, C<Bonjour>, C<epoll>, C<kqueue>, hot deployment
-and UNIX domain socket sharing support.
+L<Mojo::Server::Daemon> is a full featured, highly portable non-blocking I/O
+HTTP and WebSocket server, with C<IPv6>, C<TLS>, C<Comet> (long polling) and
+multiple event loop support.
 
-Optional modules L<IO::KQueue>, L<IO::Epoll>, L<IO::Socket::INET6>,
-L<IO::Socket::SSL> and L<Net::Rendezvous::Publish> are supported
-transparently and used if installed.
+Optional modules L<EV> (4.0+), L<IO::Socket::IP> (0.16+) and
+L<IO::Socket::SSL> (1.75+) are supported transparently through
+L<Mojo::IOLoop>, and used if installed. Individual features can also be
+disabled with the C<MOJO_NO_IPV6> and C<MOJO_NO_TLS> environment variables.
+
+See L<Mojolicious::Guides::Cookbook> for more.
+
+=head1 EVENTS
+
+L<Mojo::Server::Daemon> inherits all events from L<Mojo::Server>.
 
 =head1 ATTRIBUTES
 
 L<Mojo::Server::Daemon> inherits all attributes from L<Mojo::Server> and
 implements the following new ones.
 
-=head2 C<group>
+=head2 backlog
 
-    my $group = $daemon->group;
-    $daemon   = $daemon->group('users');
+  my $backlog = $daemon->backlog;
+  $daemon     = $daemon->backlog(128);
+
+Listen backlog size, defaults to C<SOMAXCONN>.
+
+=head2 group
+
+  my $group = $daemon->group;
+  $daemon   = $daemon->group('users');
 
 Group for server process.
 
-=head2 C<ioloop>
+=head2 inactivity_timeout
 
-    my $loop = $daemon->ioloop;
-    $daemon  = $daemon->ioloop(Mojo::IOLoop->new);
+  my $timeout = $daemon->inactivity_timeout;
+  $daemon     = $daemon->inactivity_timeout(5);
 
-Event loop for server IO, defaults to the global L<Mojo::IOLoop> singleton.
+Maximum amount of time in seconds a connection can be inactive before getting
+closed, defaults to the value of the C<MOJO_INACTIVITY_TIMEOUT> environment
+variable or C<15>. Setting the value to C<0> will allow connections to be
+inactive indefinitely.
 
-=head2 C<keep_alive_timeout>
+=head2 ioloop
 
-    my $keep_alive_timeout = $daemon->keep_alive_timeout;
-    $daemon                = $daemon->keep_alive_timeout(15);
+  my $loop = $daemon->ioloop;
+  $daemon  = $daemon->ioloop(Mojo::IOLoop->new);
 
-Timeout for keep alive connections in seconds, defaults to C<5>.
+Event loop object to use for I/O operations, defaults to the global
+L<Mojo::IOLoop> singleton.
 
-=head2 C<listen>
+=head2 listen
 
-    my $listen = $daemon->listen;
-    $daemon    = $daemon->listen('https://localhost:3000,file:///my.sock');
+  my $listen = $daemon->listen;
+  $daemon    = $daemon->listen(['https://localhost:3000']);
 
-Ports and files to listen on, defaults to C<http://*:3000>.
+List of one or more locations to listen on, defaults to the value of the
+C<MOJO_LISTEN> environment variable or C<http://*:3000>.
 
-=head2 C<listen_queue_size>
+  # Listen on IPv6 interface
+  $daemon->listen(['http://[::1]:4000']);
 
-    my $listen_queue_size = $daemon->listen_queue_zise;
-    $daemon               = $daemon->listen_queue_zise(128);
+  # Listen on two ports with HTTP and HTTPS at the same time
+  $daemon->listen([qw(http://*:3000 https://*:4000)]);
 
-Listen queue size, defaults to C<SOMAXCONN>.
+  # Use a custom certificate and key
+  $daemon->listen(['https://*:3000?cert=/x/server.crt&key=/y/server.key']);
 
-=head2 C<max_clients>
+  # Or even a custom certificate authority
+  $daemon->listen(
+    ['https://*:3000?cert=/x/server.crt&key=/y/server.key&ca=/z/ca.crt']);
 
-    my $max_clients = $daemon->max_clients;
-    $daemon         = $daemon->max_clients(1000);
+These parameters are currently available:
+
+=over 4
+
+=item ca
+
+Path to TLS certificate authority file.
+
+=item cert
+
+Path to the TLS cert file, defaults to a built-in test certificate.
+
+=item key
+
+Path to the TLS key file, defaults to a built-in test key.
+
+=item verify
+
+TLS verification mode, defaults to C<0x03>.
+
+=back
+
+=head2 max_clients
+
+  my $max = $daemon->max_clients;
+  $daemon = $daemon->max_clients(1000);
 
 Maximum number of parallel client connections, defaults to C<1000>.
 
-=head2 C<max_keep_alive_requests>
+=head2 max_requests
 
-    my $max_keep_alive_requests = $daemon->max_keep_alive_requests;
-    $daemon                     = $daemon->max_keep_alive_requests(100);
+  my $max = $daemon->max_requests;
+  $daemon = $daemon->max_requests(100);
 
-Maximum number of keep alive requests per connection, defaults to C<100>.
+Maximum number of keep alive requests per connection, defaults to C<25>.
 
-=head2 C<max_requests>
+=head2 silent
 
-    my $max_requests = $daemon->max_requests;
-    $daemon          = $daemon->max_requests(1);
-
-Maximum number of requests the daemon is allowed to handle, not used by
-default.
-
-=head2 C<pid_file>
-
-    my $pid_file = $daemon->pid_file;
-    $daemon      = $daemon->pid_file('/tmp/mojo_daemon.pid');
-
-Path to process id file, defaults to a random temporary file.
-
-=head2 C<silent>
-
-    my $silent = $daemon->silent;
-    $daemon    = $daemon->silent(1);
+  my $silent = $daemon->silent;
+  $daemon    = $daemon->silent(1);
 
 Disable console messages.
 
-=head2 C<user>
+=head2 user
 
-    my $user = $daemon->user;
-    $daemon  = $daemon->user('web');
+  my $user = $daemon->user;
+  $daemon  = $daemon->user('web');
 
 User for the server process.
-
-=head2 C<websocket_timeout>
-
-    my $websocket_timeout = $server->websocket_timeout;
-    $server               = $server->websocket_timeout(300);
-
-Timeout in seconds for WebSockets to be idle, defaults to C<300>.
 
 =head1 METHODS
 
 L<Mojo::Server::Daemon> inherits all methods from L<Mojo::Server> and
 implements the following new ones.
 
-=head2 C<prepare_ioloop>
+=head2 run
 
-    $daemon->prepare_ioloop;
+  $daemon->run;
 
-Prepare event loop.
+Run server.
 
-=head2 C<prepare_pid_file>
+=head2 setuidgid
 
-    $daemon->prepare_pid_file;
-
-Prepare process id file.
-
-=head2 C<run>
-
-    $daemon->run;
-
-Start server.
-
-=head2 C<setuidgid>
-
-    $daemon->setuidgid;
+  $daemon = $daemon->setuidgid;
 
 Set user and group for process.
 
+=head2 start
+
+  $daemon = $daemon->start;
+
+Start accepting connections.
+
+=head2 stop
+
+  $daemon = $daemon->stop;
+
+Stop accepting connections.
+
+=head1 DEBUGGING
+
+You can set the C<MOJO_DAEMON_DEBUG> environment variable to get some advanced
+diagnostics information printed to C<STDERR>.
+
+  MOJO_DAEMON_DEBUG=1
+
 =head1 SEE ALSO
 
-L<Mojolicious>, L<Mojolicious::Guides>, L<http://mojolicious.org>.
+L<Mojolicious>, L<Mojolicious::Guides>, L<http://mojolicio.us>.
 
 =cut

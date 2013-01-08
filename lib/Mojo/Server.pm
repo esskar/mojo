@@ -1,176 +1,156 @@
 package Mojo::Server;
-
-use strict;
-use warnings;
-
-use base 'Mojo::Base';
+use Mojo::Base 'Mojo::EventEmitter';
 
 use Carp 'croak';
+use FindBin;
 use Mojo::Loader;
+use Mojo::Util 'md5_sum';
+use Scalar::Util 'blessed';
 
-__PACKAGE__->attr(
-    app => sub {
-        my $self = shift;
+has app => sub { shift->build_app('Mojo::HelloWorld') };
 
-        # App in environment
-        return $ENV{MOJO_APP} if ref $ENV{MOJO_APP};
+sub new {
+  my $self = shift->SUPER::new(@_);
+  $self->on(request => sub { shift->app->handler(shift) });
+  return $self;
+}
 
-        # Load
-        if (my $e = Mojo::Loader->load($self->app_class)) {
-            die $e if ref $e;
-        }
+sub build_app {
+  my ($self, $app) = @_;
+  local $ENV{MOJO_EXE};
+  return $app->new unless my $e = Mojo::Loader->new->load($app);
+  die ref $e ? $e : qq{Couldn't find application class "$app".\n};
+}
 
-        return $self->app_class->new;
-    }
-);
-__PACKAGE__->attr(app_class =>
-      sub { ref $ENV{MOJO_APP} || $ENV{MOJO_APP} || 'Mojo::HelloWorld' });
-__PACKAGE__->attr(
-    build_tx_cb => sub {
-        sub {
-            my $self = shift;
+sub build_tx { shift->app->build_tx }
 
-            # Reload
-            if ($self->reload) {
-                if (my $e = Mojo::Loader->reload) { warn $e }
-                delete $self->{app};
-            }
+sub load_app {
+  my ($self, $path) = @_;
 
-            return $self->app->build_tx_cb->($self->app);
-          }
-    }
-);
-__PACKAGE__->attr(
-    handler_cb => sub {
-        sub {
+  # Clean environment (reset FindBin)
+  {
+    local $0 = $path;
+    FindBin->again;
+    local $ENV{MOJO_APP_LOADER} = 1;
+    local $ENV{MOJO_EXE};
 
-            # Application
-            my $app = shift->app;
+    # Try to load application from script into sandbox
+    $self->app(my $app = eval sprintf <<'EOF', md5_sum($path . $$));
+package Mojo::Server::SandBox::%s;
+my $app = do $path;
+if (!$app && (my $e = $@ || $!)) { die $e }
+$app;
+EOF
+    die qq{Couldn't load application from file "$path": $@} if !$app && $@;
+    die qq{File "$path" did not return an application object.\n}
+      unless blessed $app && $app->isa('Mojo');
+  };
+  FindBin->again;
 
-            # Transaction
-            my $tx = shift;
+  return $self->app;
+}
 
-            # Handler
-            $app->handler($tx);
-
-            # Delayed
-            $app->log->debug(
-                'Waiting for delayed response, forgot to render or resume?')
-              unless $tx->is_writing;
-          }
-    }
-);
-__PACKAGE__->attr(reload => sub { $ENV{MOJO_RELOAD} || 0 });
-__PACKAGE__->attr(
-    websocket_handshake_cb => sub {
-        sub {
-            my $self = shift;
-            return $self->app->websocket_handshake_cb->($self->app, @_);
-          }
-    }
-);
-
-# Are you saying you're never going to eat any animal again? What about bacon?
-# No.
-# Ham?
-# No.
-# Pork chops?
-# Dad, those all come from the same animal.
-# Heh heh heh. Ooh, yeah, right, Lisa. A wonderful, magical animal.
 sub run { croak 'Method "run" not implemented by subclass' }
 
 1;
-__END__
 
 =head1 NAME
 
-Mojo::Server - HTTP Server Base Class
+Mojo::Server - HTTP server base class
 
 =head1 SYNOPSIS
 
-    use base 'Mojo::Server';
+  package Mojo::Server::MyServer;
+  use Mojo::Base 'Mojo::Server';
 
-    sub run {
-        my $self = shift;
+  sub run {
+    my $self = shift;
 
-        # Get a transaction
-        my $tx = $self->build_tx_cb->($self);
+    # Get a transaction
+    my $tx = $self->build_tx;
 
-        # Call the handler
-        $tx = $self->handler_cb->($self);
-    }
+    # Emit "request" event
+    $self->emit(request => $tx);
+  }
 
 =head1 DESCRIPTION
 
 L<Mojo::Server> is an abstract HTTP server base class.
 
+=head1 EVENTS
+
+L<Mojo::Server> inherits all events from L<Mojo::EventEmitter> and can emit
+the following new ones.
+
+=head2 request
+
+  $server->on(request => sub {
+    my ($server, $tx) = @_;
+    ...
+  });
+
+Emitted when a request is ready and needs to be handled.
+
+  $server->unsubscribe('request');
+  $server->on(request => sub {
+    my ($server, $tx) = @_;
+    $tx->res->code(200);
+    $tx->res->headers->content_type('text/plain');
+    $tx->res->body('Hello World!');
+    $tx->resume;
+  });
+
 =head1 ATTRIBUTES
 
 L<Mojo::Server> implements the following attributes.
 
-=head2 C<app>
+=head2 app
 
-    my $app = $server->app;
-    $server = $server->app(MojoSubclass->new);
+  my $app = $server->app;
+  $server = $server->app(MojoSubclass->new);
 
 Application this server handles, defaults to a L<Mojo::HelloWorld> object.
 
-=head2 C<app_class>
-
-    my $app_class = $server->app_class;
-    $server       = $server->app_class('MojoSubclass');
-
-Class of the application this server handles, defaults to
-L<Mojo::HelloWorld>.
-
-=head2 C<build_tx_cb>
-
-    my $btx = $server->build_tx_cb;
-    $server = $server->build_tx_cb(sub {
-        my $self = shift;
-        return Mojo::Transaction::HTTP->new;
-    });
-
-Transaction builder callback.
-
-=head2 C<handler_cb>
-
-    my $handler = $server->handler_cb;
-    $server     = $server->handler_cb(sub {
-        my ($self, $tx) = @_;
-    });
-
-Handler callback.
-
-=head2 C<reload>
-
-    my $reload = $server->reload;
-    $server    = $server->reload(1);
-
-Activate automatic reloading.
-
-=head2 C<websocket_handshake_cb>
-
-    my $handshake = $server->websocket_handshake_cb;
-    $server       = $server->websocket_handshake_cb(sub {
-        my ($self, $tx) = @_;
-    });
-
-WebSocket handshake callback.
-
 =head1 METHODS
 
-L<Mojo::Server> inherits all methods from L<Mojo::Base> and implements the
-following new ones.
+L<Mojo::Server> inherits all methods from L<Mojo::EventEmitter> and implements
+the following new ones.
 
-=head2 C<run>
+=head2 new
 
-    $server->run;
+  my $server = Mojo::Server->new;
 
-Start server.
+Construct a new L<Mojo::Server> object and subscribe to C<request> event with
+default request handling.
+
+=head2 build_app
+
+  my $app = $server->build_app('Mojo::HelloWorld');
+
+Build application from class.
+
+=head2 build_tx
+
+  my $tx = $server->build_tx;
+
+Let application build a transaction.
+
+=head2 load_app
+
+  my $app = $server->load_app('/home/sri/myapp.pl');
+
+Load application from script.
+
+  say Mojo::Server->new->load_app('./myapp.pl')->home;
+
+=head2 run
+
+  $server->run;
+
+Run server. Meant to be overloaded in a subclass.
 
 =head1 SEE ALSO
 
-L<Mojolicious>, L<Mojolicious::Guides>, L<http://mojolicious.org>.
+L<Mojolicious>, L<Mojolicious::Guides>, L<http://mojolicio.us>.
 
 =cut

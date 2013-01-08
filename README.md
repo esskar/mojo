@@ -1,111 +1,113 @@
-Back in the early days of the web there was this wonderful Perl library
-called CGI, many people only learned Perl because of it.
-It was simple enough to get started without knowing much about the language
-and powerful enough to keep you going, learning by doing was much fun.
-While most of the techniques used are outdated now, the idea behind it is
-not.
-Mojolicious is a new attempt at implementing this idea using state of the art
-technology.
 
-Features
---------
+# Mojolicious [![Build Status](https://secure.travis-ci.org/kraih/mojo.png)](http://travis-ci.org/kraih/mojo)
 
-* An amazing MVC web framework supporting a simplified single file mode
-  through Mojolicious::Lite.
+  Back in the early days of the web, many people learned Perl because of a
+  wonderful Perl library called [CGI](http://metacpan.org/module/CGI). It was
+  simple enough to get started without knowing much about the language and
+  powerful enough to keep you going, learning by doing was much fun. While
+  most of the techniques used are outdated now, the idea behind it is not.
+  Mojolicious is a new attempt at implementing this idea using state of the
+  art technology.
 
-  Powerful out of the box with RESTful routes, plugins, Perl-ish templates,
-  session management, signed cookies, testing framework, static file server,
-  I18N, first class unicode support and much more for you to discover.
+## Features
 
-* Very clean, portable and Object Oriented pure Perl API without any hidden
-  magic and no requirements besides Perl 5.8.7.
+  * An amazing real-time web framework, allowing you to easily grow single
+    file [Mojolicious::Lite](http://mojolicio.us/perldoc/Mojolicious/Lite)
+    prototypes into well structured web applications.
+    * Powerful out of the box with RESTful routes, plugins, commands, Perl-ish
+      templates, content negotiation, session management, testing framework,
+      static file server, first class Unicode support and much more for you to
+      discover.
+  * Very clean, portable and Object Oriented pure-Perl API without any hidden
+    magic and no requirements besides Perl 5.10.1 (although 5.14+ is
+    recommended, and optional CPAN modules will be used to provide advanced
+    functionality if they are installed).
+  * Full stack HTTP and WebSocket client/server implementation with IPv6, TLS,
+    SNI, IDNA, Comet (long polling) and gzip compression support.
+  * Built-in non-blocking I/O web server, supporting multiple event loops and
+    hot deployment, perfect for embedding.
+  * Automatic CGI and [PSGI](http://plackperl.org) detection.
+  * JSON and HTML/XML parser with CSS selector support.
+  * Fresh code based upon years of experience developing
+    [Catalyst](http://www.catalystframework.org).
 
-* Full stack HTTP 1.1 and WebSocket client/server implementation with IPv6,
-  TLS, Bonjour, IDNA, Comet (long polling), chunking and multipart support.
+## Installation
 
-* Builtin async IO and prefork web server supporting epoll, kqueue, hot
-  deployment and UNIX domain socket sharing, perfect for embedding.
+  All you need is a oneliner, it takes less than a minute.
 
-* Automatic CGI, FastCGI and PSGI detection.
+    $ curl get.mojolicio.us | sh
 
-* JSON and XML/HTML5 parser with CSS3 selector support.
+  We recommend the use of a [Perlbrew](http://perlbrew.pl) environment.
 
-* Fresh code based upon years of experience developing Catalyst.
+## Getting Started
 
-Duct Tape For The HTML5 Web
----------------------------
-
-Web development for humans, making hard things possible and everything fun.
+  These three lines are a whole web application.
 
     use Mojolicious::Lite;
 
-    get '/hello' => sub { shift->render(text => 'Hello World!') }
+    get '/' => {text => 'Hello World!'};
 
+    app->start;
+
+  To run this example with the built-in development web server just put the
+  code into a file and start it with `morbo`.
+
+    $ morbo hello.pl
+    Server available at http://127.0.0.1:3000.
+
+    $ curl http://127.0.0.1:3000/
+    Hello World!
+
+## Duct tape for the HTML5 web
+
+  Web development for humans, making hard things possible and everything fun.
+
+    use Mojolicious::Lite;
+
+    # Simple plain text response
+    get '/' => {text => 'Hello World!'};
+
+    # Route associating "/time" with template in DATA section
     get '/time' => 'clock';
 
+    # RESTful web service with JSON and text representation
+    get '/list/:offset' => sub {
+      my $self    = shift;
+      my $numbers = [0 .. $self->param('offset')];
+      $self->respond_to(
+        json => {json => $numbers},
+        txt  => {text => join(',', @$numbers)}
+      );
+    };
+
+    # Scrape information from remote sites
+    post '/title' => sub {
+      my $self = shift;
+      my $url  = $self->param('url') || 'http://mojolicio.us';
+      $self->render_text(
+        $self->ua->get($url)->res->dom->html->head->title->text);
+    };
+
+    # WebSocket echo service
     websocket '/echo' => sub {
-        my $self = shift;
-        $self->receive_message(
-            sub {
-                my ($self, $message) = @_;
-                $self->send_message("echo: $message");
-            }
-        );
-    };
-
-    get '/title' => sub {
-        my $self = shift;
-        my $url  = $self->param('url');
-        $self->render(text =>
-              $self->client->get($url)->res->dom->at('title')->text);
-    };
-
-    post '/:offset' => sub {
-        my $self   = shift;
-        my $offset = $self->param('offset') || 23;
-        $self->render(json => {list => [0 .. $offset]});
+      my $self = shift;
+      $self->on(message => sub {
+        my ($self, $msg) = @_;
+        $self->send("echo: $msg");
+      });
     };
 
     app->start;
     __DATA__
 
     @@ clock.html.ep
-    % my ($second, $minute, $hour) = (localtime(time))[0, 1, 2];
-    <%= link_to clock => begin %>
-        The time is <%= $hour %>:<%= $minute %>:<%= $second %>.
-    <% end %>
+    % use Time::Piece;
+    % my $now = localtime;
+    The time is <%= $now->hms %>.
 
-For more user friendly documentation see "perldoc Mojolicious::Guides"
-and "perldoc Mojolicious::Lite".
+  Single file prototypes like this one can easily grow into well-structured
+  applications.
 
-Have Some Cake
---------------
+## Want to know more?
 
-Loosely coupled building blocks, use what you like and just ignore the rest.
-
-    .---------------------------------------------------------------.
-    |                             Fun!                              |
-    '---------------------------------------------------------------'
-    .---------------------------------------------------------------.
-    |                                                               |
-    |                .----------------------------------------------'
-    |                | .--------------------------------------------.
-    |   Application  | |              Mojolicious::Lite             |
-    |                | '--------------------------------------------'
-    |                | .--------------------------------------------.
-    |                | |                 Mojolicious                |
-    '----------------' '--------------------------------------------'
-    .---------------------------------------------------------------.
-    |                             Mojo                              |
-    '---------------------------------------------------------------'
-    .-------. .-----------. .--------. .------------. .-------------.
-    |  CGI  | |  FastCGI  | |  PSGI  | |  HTTP 1.1  | |  WebSocket  |
-    '-------' '-----------' '--------' '------------' '-------------'
-
-Installation
-------------
-
-    perl Makefile.PL
-    make
-    make test
-    make install
+  Take a look at our excellent [documentation](http://mojolicio.us/perldoc>)!

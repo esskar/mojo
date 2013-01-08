@@ -1,76 +1,70 @@
 package Mojo::Upload;
-
-use strict;
-use warnings;
-
-use base 'Mojo::Base';
+use Mojo::Base -base;
 
 use Carp 'croak';
 use Mojo::Asset::File;
 use Mojo::Headers;
 
-__PACKAGE__->attr(asset => sub { Mojo::Asset::File->new });
-__PACKAGE__->attr([qw/filename name/]);
-__PACKAGE__->attr(headers => sub { Mojo::Headers->new });
+has asset => sub { Mojo::Asset::File->new };
+has [qw(filename name)];
+has headers => sub { Mojo::Headers->new };
 
-# B-6
-# You sunk my scrabbleship!
-# This game makes no sense.
-# Tell that to the good men who just lost their lives... SEMPER-FI!
-sub move_to { shift->asset->move_to(@_) }
+sub move_to {
+  my $self = shift;
+  $self->asset->move_to(@_);
+  return $self;
+}
 
-sub size { shift->asset->size }
-
+sub size  { shift->asset->size }
 sub slurp { shift->asset->slurp }
 
 1;
-__END__
 
 =head1 NAME
 
-Mojo::Upload - Upload Container
+Mojo::Upload - Upload
 
 =head1 SYNOPSIS
 
-    use Mojo::Upload;
+  use Mojo::Upload;
 
-    my $upload = Mojo::Upload->new;
-    print $upload->filename;
-    $upload->move_to('/foo/bar/baz.txt');
+  my $upload = Mojo::Upload->new;
+  say $upload->filename;
+  $upload->move_to('/home/sri/foo.txt');
 
 =head1 DESCRIPTION
 
-L<Mojo::Upload> is a container for uploads.
+L<Mojo::Upload> is a container for uploaded files.
 
 =head1 ATTRIBUTES
 
 L<Mojo::Upload> implements the following attributes.
 
-=head2 C<asset>
+=head2 asset
 
-    my $asset = $upload->asset;
-    $upload   = $upload->asset(Mojo::Asset::File->new);
+  my $asset = $upload->asset;
+  $upload   = $upload->asset(Mojo::Asset::File->new);
 
-Asset containing the uploaded data.
+Asset containing the uploaded data, defaults to a L<Mojo::Asset::File> object.
 
-=head2 C<filename>
+=head2 filename
 
-    my $filename = $upload->filename;
-    $upload      = $upload->filename('foo.txt');
+  my $filename = $upload->filename;
+  $upload      = $upload->filename('foo.txt');
 
 Name of the uploaded file.
 
-=head2 C<headers>
+=head2 headers
 
-    my $headers = $upload->headers;
-    $upload     = $upload->headers(Mojo::Headers->new);
+  my $headers = $upload->headers;
+  $upload     = $upload->headers(Mojo::Headers->new);
 
-Headers for upload.
+Headers for upload, defaults to a L<Mojo::Headers> object.
 
-=head2 C<name>
+=head2 name
 
-    my $name = $upload->name;
-    $upload  = $upload->name('foo');
+  my $name = $upload->name;
+  $upload  = $upload->name('foo');
 
 Name of the upload.
 
@@ -79,26 +73,26 @@ Name of the upload.
 L<Mojo::Upload> inherits all methods from L<Mojo::Base> and implements the
 following new ones.
 
-=head2 C<move_to>
+=head2 move_to
 
-    $upload->move_to('/foo/bar/baz.txt');
+  $upload = $upload->move_to('/home/sri/foo.txt');
 
-Move uploaded data to a specific file.
+Move uploaded data into a specific file.
 
-=head2 C<size>
+=head2 size
 
-    my $size = $upload->size;
+  my $size = $upload->size;
 
-Size of upload in bytes.
+Size of uploaded data in bytes.
 
-=head2 C<slurp>
+=head2 slurp
 
-    my $string = $upload->slurp;
+  my $string = $upload->slurp;
 
-Read all upload data at once.
+Read all uploaded data at once.
 
 =head1 SEE ALSO
 
-L<Mojolicious>, L<Mojolicious::Guides>, L<http://mojolicious.org>.
+L<Mojolicious>, L<Mojolicious::Guides>, L<http://mojolicio.us>.
 
 =cut

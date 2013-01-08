@@ -1,64 +1,46 @@
-#!/usr/bin/env perl
-
-use strict;
-use warnings;
-
-# Use bundled libraries
 use FindBin;
 use lib "$FindBin::Bin/../lib";
+use Mojo::Base -strict;
 
-# Kif, I'm feeling the Captain's Itch.
-# I'll get the powder, sir.
 use Mojo::IOLoop;
 
-# The loop
-my $loop = Mojo::IOLoop->new;
-
-# Buffer for incoming data
-my $buffer = {};
-
 # Minimal ioloop example demonstrating how to cheat at HTTP benchmarks :)
-$loop->listen(
-    port      => 3000,
-    accept_cb => sub {
-        my ($loop, $id) = @_;
-
-        # Initialize buffer
-        $buffer->{$id} = '';
-    },
-    read_cb => sub {
-        my ($loop, $id, $chunk) = @_;
+my %buffer;
+Mojo::IOLoop->server(
+  {port => 3000} => sub {
+    my ($loop, $stream, $id) = @_;
+    $buffer{$id} = '';
+    $stream->on(
+      read => sub {
+        my ($stream, $chunk) = @_;
 
         # Append chunk to buffer
-        $buffer->{$id} .= $chunk;
+        $buffer{$id} .= $chunk;
 
         # Check if we got start line and headers (no body support)
-        if (index $buffer->{$id}, "\x0d\x0a\x0d\x0a") {
+        if (index($buffer{$id}, "\x0d\x0a\x0d\x0a") >= 0) {
 
-            # Clean buffer
-            delete $buffer->{$id};
+          # Clean buffer
+          delete $buffer{$id};
 
-            # Write a minimal HTTP response
-            # (not spec compliant but benchmarks won't care)
-            $loop->write($id => "HTTP/1.1 200 OK\x0d\x0a"
-                  . "Connection: keep-alive\x0d\x0a\x0d\x0a");
+          # Write a minimal HTTP response
+          # (the "Hello World!" message has been optimized away!)
+          $stream->write("HTTP/1.1 200 OK\x0d\x0a"
+              . "Connection: keep-alive\x0d\x0a\x0d\x0a");
         }
-    },
-    error_cb => sub {
-        my ($self, $id) = @_;
-
-        # Clean buffer
-        delete $buffer->{$id};
-    }
+      }
+    );
+    $stream->on(close => sub { delete $buffer{$id} });
+  }
 ) or die "Couldn't create listen socket!\n";
 
 print <<'EOF';
 Starting server on port 3000.
 Try something like "ab -c 30 -n 100000 -k http://127.0.0.1:3000/" for testing.
-On a MacBook Pro 13" this results in about 19k req/s.
+On a MacBook Air this results in about 18k req/s.
 EOF
 
-# Start loop
-$loop->start;
+# Start event loop
+Mojo::IOLoop->start;
 
 1;

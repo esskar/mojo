@@ -1,1078 +1,756 @@
 package Mojo::DOM;
+use Mojo::Base -base;
+use overload
+  '%{}'    => sub { shift->attrs },
+  'bool'   => sub {1},
+  '""'     => sub { shift->to_xml },
+  fallback => 1;
 
-use strict;
-use warnings;
+# "Fry: This snow is beautiful. I'm glad global warming never happened.
+#  Leela: Actually, it did. But thank God nuclear winter canceled it out."
+use Carp 'croak';
+use Mojo::Collection;
+use Mojo::DOM::CSS;
+use Mojo::DOM::HTML;
+use Mojo::Util 'squish';
+use Scalar::Util qw(blessed weaken);
 
-use base 'Mojo::Base';
-use overload '""' => sub { shift->to_xml }, fallback => 1;
+sub AUTOLOAD {
+  my $self = shift;
 
-use Mojo::ByteStream 'b';
-use Scalar::Util 'weaken';
+  # Method
+  my ($package, $method) = our $AUTOLOAD =~ /^([\w:]+)::(\w+)$/;
+  croak "Undefined subroutine &${package}::$method called"
+    unless blessed $self && $self->isa(__PACKAGE__);
 
-# How are the kids supposed to get home?
-# I dunno. Internet?
-__PACKAGE__->attr(charset => 'UTF-8');
-__PACKAGE__->attr(tree => sub { ['root'] });
+  # Search children
+  my $children = $self->children($method);
+  return @$children > 1 ? $children : $children->[0] if @$children;
+  croak qq{Can't locate object method "$method" via package "$package"};
+}
 
-# Regex
-my $CSS_ESCAPE_RE = qr/\\[^0-9a-fA-F]|\\[0-9a-fA-F]{1,6}/;
-my $CSS_ATTR_RE   = qr/
-    \[
-    ((?:$CSS_ESCAPE_RE|\w)+)   # Key
-    (?:
-    (\W)?                      # Operator
-    =
-    "((?:\\"|[^"])+)"          # Value
-    )?
-    \]
-/x;
-my $CSS_CLASS_RE        = qr/\.((?:\\\.|[^\.])+)/;
-my $CSS_ELEMENT_RE      = qr/^((?:\\\.|\\\#|[^\.\#])+)/;
-my $CSS_ID_RE           = qr/\#((?:\\\#|[^\#])+)/;
-my $CSS_PSEUDO_CLASS_RE = qr/(?:\:(\w+)(?:\(([^\)]+)\))?)/;
-my $CSS_TOKEN_RE        = qr/
-    (\s*,\s*)?                                                   # Separator
-    ((?:[^\[\\\:\s]|$CSS_ESCAPE_RE\s?)+)?                        # Element
-    ((?:\:\w+(?:\([^\)]+\))?)*)?                                 # Pseudoclass
-    ((?:\[(?:$CSS_ESCAPE_RE|\w)+(?:\W?="(?:\\"|[^"])+")?\])*)?   # Attributes
-    (?:
-    \s*
-    ([\>\+\~])                                                   # Combinator
-    )?
-/x;
-my $XML_ATTR_RE = qr/
-    ([^=\s]+)                                   # Key
-    (?:\s*=\s*(?:"([^"]*)"|'([^']*)'|(\S+)))?   # Value
-/x;
-my $XML_END_RE   = qr/^\s*\/\s*(.+)\s*/;
-my $XML_START_RE = qr/(\S+)([\s\S]*)/;
-my $XML_TOKEN_RE = qr/
-    ([^<]*)                  # Text
-    (?:
-    <\?(.*?)\?>              # Processing Instruction
-    |
-    <\!--(.*?)-->            # Comment
-    |
-    <\!\[CDATA\[(.*?)\]\]>   # CDATA
-    |
-    <\!DOCTYPE([^>]*)>       # DOCTYPE
-    |
-    <(
-    \s*
-    [^>\s]+                  # Tag
-    (?:
-        \s*
-        [^=\s>"']+           # Key
-        (?:
-            \s*
-            =
-            \s*
-            (?:
-            "[^"]*?"         # Quotation marks
-            |
-            '[^']*?'         # Apostrophes
-            |
-            [^>\s]+          # Unquoted
-            )
-        )?
-        \s*
-    )*
-    )>
-    )??
-/xis;
+sub DESTROY { }
+
+sub new {
+  my $class = shift;
+  my $self = bless [Mojo::DOM::HTML->new], ref $class || $class;
+  return @_ ? $self->parse(@_) : $self;
+}
 
 sub all_text {
-    my $self = shift;
+  my ($self, $trim) = @_;
+  my $tree = $self->tree;
+  return _text(_elements($tree), 1, _trim($tree, $trim));
+}
 
-    # Text
-    my $text = '';
+sub append { shift->_add(1, @_) }
 
-    # Tree
-    my $tree = $self->tree;
-
-    # Walk tree
-    my $start = $tree->[0] eq 'root' ? 1 : 4;
-    my @stack = @$tree[$start .. $#$tree];
-    while (my $e = shift @stack) {
-
-        # Type
-        my $type = $e->[0];
-
-        unshift @stack, @$e[4 .. $#$e] and next if $type eq 'tag';
-
-        # Text or CDATA
-        if ($type eq 'text' || $type eq 'cdata') {
-            my $content = $e->[1];
-            $text .= $content if $content =~ /\S+/;
-        }
-    }
-
-    return $text;
+sub append_content {
+  my ($self, $new) = @_;
+  my $tree = $self->tree;
+  push @$tree, @{_parent($self->_parse("$new"), $tree)};
+  return $self;
 }
 
 sub at { shift->find(@_)->[0] }
 
 sub attrs {
-    my $self = shift;
+  my $self = shift;
 
-    # Tree
-    my $tree = $self->tree;
+  # Hash
+  my $tree = $self->tree;
+  my $attrs = $tree->[0] eq 'root' ? {} : $tree->[2];
+  return $attrs unless @_;
 
-    # Root
-    return if $tree->[0] eq 'root';
+  # Get
+  return $attrs->{$_[0]} // '' unless @_ > 1 || ref $_[0];
 
-    return $tree->[2];
+  # Set
+  %$attrs = (%$attrs, %{ref $_[0] ? $_[0] : {@_}});
+
+  return $self;
 }
 
+sub charset { shift->_html(charset => @_) }
+
 sub children {
-    my $self = shift;
+  my ($self, $type) = @_;
 
-    # Children
-    my @children;
+  # Walk tree
+  my @children;
+  my $charset = $self->charset;
+  my $xml     = $self->xml;
+  my $tree    = $self->tree;
+  for my $e (@$tree[($tree->[0] eq 'root' ? 1 : 4) .. $#$tree]) {
 
-    # Tree
-    my $tree = $self->tree;
+    # Make sure child is the right type
+    next unless $e->[0] eq 'tag';
+    next if defined $type && $e->[1] ne $type;
+    push @children, $self->new->charset($charset)->tree($e)->xml($xml);
+  }
 
-    # Walk tree
-    my $start = $tree->[0] eq 'root' ? 1 : 4;
-    for my $e (@$tree[$start .. $#$tree]) {
+  return Mojo::Collection->new(@children);
+}
 
-        # Tag
-        next unless $e->[0] eq 'tag';
+sub content_xml {
+  my $self = shift;
 
-        # Add child
-        push @children, $self->new(charset => $self->charset, tree => $e);
-    }
-
-    return \@children;
+  # Render children
+  my $tree    = $self->tree;
+  my $charset = $self->charset;
+  my $xml     = $self->xml;
+  return join '', map {
+    Mojo::DOM::HTML->new(charset => $charset, tree => $_, xml => $xml)->render
+  } @$tree[($tree->[0] eq 'root' ? 1 : 4) .. $#$tree];
 }
 
 sub find {
-    my ($self, $css) = @_;
+  my ($self, $selector) = @_;
 
-    # Parse CSS selectors
-    my $pattern = $self->_parse_css($css);
-
-    # Filter tree
-    return $self->_select($self->tree, $pattern);
-}
-
-sub name {
-    my ($self, $name) = @_;
-
-    # Tree
-    my $tree = $self->tree;
-
-    # Root
-    return if $tree->[0] eq 'root';
-
-    # Get
-    return $tree->[1] unless $name;
-
-    # Set
-    $tree->[1] = $name;
-
-    return $self;
+  # Match selector against tree and upgrade results
+  my $charset = $self->charset;
+  my $xml     = $self->xml;
+  return Mojo::Collection->new(
+    map { $self->new->charset($charset)->tree($_)->xml($xml) }
+      @{Mojo::DOM::CSS->new(tree => $self->tree)->select($selector)});
 }
 
 sub namespace {
-    my $self = shift;
+  my $self = shift;
 
-    # Current
-    my $current = $self->tree;
-    return if $current->[0] eq 'root';
+  # Namespace prefix
+  return '' if (my $current = $self->tree)->[0] eq 'root';
+  my $ns = $current->[1] =~ /^(.*?):/ ? "xmlns:$1" : undef;
 
-    # Prefix
-    my $prefix = '';
-    if ($current->[1] =~ /^(.*?)\:/) { $prefix = $1 }
+  # Walk tree
+  while ($current) {
+    last if $current->[0] eq 'root';
 
-    # Walk tree
-    while ($current) {
+    # Namespace for prefix
+    my $attrs = $current->[2];
+    if ($ns) { /^\Q$ns\E$/ and return $attrs->{$_} for keys %$attrs }
 
-        # Root
-        return if $current->[0] eq 'root';
-
-        # Attributes
-        my $attrs = $current->[2];
-
-        # Namespace for prefix
-        if ($prefix) {
-            for my $key (keys %$attrs) {
-                return $attrs->{$key} if $key =~ /^xmlns\:$prefix$/;
-            }
-        }
-
-        # Namespace attribute
-        if (my $namespace = $attrs->{xmlns}) { return $namespace }
-
-        # Parent
-        $current = $current->[3];
-    }
-}
-
-sub parent {
-    my $self = shift;
-
-    # Tree
-    my $tree = $self->tree;
-
-    # Root
-    return if $tree->[0] eq 'root';
+    # Namespace attribute
+    elsif (defined $attrs->{xmlns}) { return $attrs->{xmlns} }
 
     # Parent
-    return $self->new(charset => $self->charset, tree => $tree->[3]);
+    $current = $current->[3];
+  }
+
+  return '';
+}
+
+sub next { shift->_sibling(1) }
+
+sub parent {
+  my $self = shift;
+  return undef if (my $tree = $self->tree)->[0] eq 'root';
+  return $self->new->charset($self->charset)->tree($tree->[3])
+    ->xml($self->xml);
 }
 
 sub parse {
-    my ($self, $xml) = @_;
-
-    # Parse
-    $self->tree($self->_parse_xml($xml));
+  my $self = shift;
+  $self->[0]->parse(@_);
+  return $self;
 }
 
+sub prepend { shift->_add(0, @_) }
+
+sub prepend_content {
+  my ($self, $new) = @_;
+  my $tree = $self->tree;
+  splice @$tree, $tree->[0] eq 'root' ? 1 : 4, 0,
+    @{_parent($self->_parse("$new"), $tree)};
+  return $self;
+}
+
+sub previous { shift->_sibling(0) }
+
+sub remove { shift->replace('') }
+
 sub replace {
-    my ($self, $new) = @_;
+  my ($self, $new) = @_;
 
-    # Parse
-    $new = ref $new ? $new->tree : $self->_parse_xml($new);
+  # Parse
+  my $tree = $self->tree;
+  if   ($tree->[0] eq 'root') { return $self->xml(undef)->parse($new) }
+  else                        { $new = $self->_parse("$new") }
 
-    # Tree
-    my $tree = $self->tree;
+  # Find and replace
+  my $parent = $tree->[3];
+  my $i = $parent->[0] eq 'root' ? 1 : 4;
+  for my $e (@$parent[$i .. $#$parent]) {
+    last if $e == $tree;
+    $i++;
+  }
+  splice @$parent, $i, 1, @{_parent($new, $parent)};
 
-    # Root
-    return $self->replace_content(
-        $self->new(charset => $self->charset, tree => $new))
-      if $tree->[0] eq 'root';
-
-    # Parent
-    my $parent = $tree->[3];
-
-    # Replacements
-    my @new;
-    for my $e (@$new[1 .. $#$new]) {
-        $e->[3] = $parent if $e->[0] eq 'tag';
-        push @new, $e;
-    }
-
-    # Find
-    my $i = $parent->[0] eq 'root' ? 1 : 4;
-    for my $e (@$parent[$i .. $#$parent]) {
-        last if $e == $tree;
-        $i++;
-    }
-
-    # Replace
-    splice @$parent, $i, 1, @new;
-
-    return $self;
+  return $self;
 }
 
 sub replace_content {
-    my ($self, $new) = @_;
-
-    # Parse
-    $new = ref $new ? $new->tree : $self->_parse_xml($new);
-
-    # Tree
-    my $tree = $self->tree;
-
-    # Replacements
-    my @new;
-    for my $e (@$new[1 .. $#$new]) {
-        $e->[3] = $tree if $e->[0] eq 'tag';
-        push @new, $e;
-    }
-
-    # Replace
-    my $start = $tree->[0] eq 'root' ? 1 : 4;
-    splice @$tree, $start, $#$tree, @new;
-
-    return $self;
+  my ($self, $new) = @_;
+  my $tree = $self->tree;
+  splice @$tree, $tree->[0] eq 'root' ? 1 : 4, $#$tree,
+    @{_parent($self->_parse("$new"), $tree)};
+  return $self;
 }
 
 sub root {
-    my $self = shift;
+  my $self = shift;
 
-    # Find root
-    my $root = $self->tree;
-    while ($root->[0] eq 'tag') {
-        last unless my $parent = $root->[3];
-        $root = $parent;
-    }
+  # Find root
+  my $root = $self->tree;
+  while ($root->[0] eq 'tag') {
+    last unless my $parent = $root->[3];
+    $root = $parent;
+  }
 
-    return $self->new(charset => $self->charset, tree => $root);
+  return $self->new->charset($self->charset)->tree($root)->xml($self->xml);
 }
 
 sub text {
-    my $self = shift;
+  my ($self, $trim) = @_;
+  my $tree = $self->tree;
+  return _text(_elements($tree), 0, _trim($tree, $trim));
+}
 
-    # Text
-    my $text = '';
+sub text_after {
+  my ($self, $trim) = @_;
 
-    # Walk stack
-    for my $e (@{$self->tree}) {
+  # Find following text elements
+  return '' if (my $tree = $self->tree)->[0] eq 'root';
+  my (@elements, $started);
+  for my $e (@{_elements($tree->[3])}) {
+    ++$started and next if $e eq $tree;
+    next unless $started;
+    last if $e->[0] eq 'tag';
+    push @elements, $e;
+  }
 
-        # Meta data
-        next unless ref $e eq 'ARRAY';
+  return _text(\@elements, 0, _trim($tree->[3], $trim));
+}
 
-        # Type
-        my $type = $e->[0];
+sub text_before {
+  my ($self, $trim) = @_;
 
-        # Text or CDATA
-        if ($type eq 'text' || $type eq 'cdata') {
-            my $content = $e->[1];
-            $text .= $content if $content =~ /\S+/;
-        }
+  # Find preceding text elements
+  return '' if (my $tree = $self->tree)->[0] eq 'root';
+  my @elements;
+  for my $e (@{_elements($tree->[3])}) {
+    last if $e eq $tree;
+    push @elements, $e;
+    @elements = () if $e->[0] eq 'tag';
+  }
+
+  return _text(\@elements, 0, _trim($tree->[3], $trim));
+}
+
+sub to_xml { shift->[0]->render }
+
+sub tree { shift->_html(tree => @_) }
+
+sub type {
+  my ($self, $type) = @_;
+
+  # Get
+  return '' if (my $tree = $self->tree)->[0] eq 'root';
+  return $tree->[1] unless $type;
+
+  # Set
+  $tree->[1] = $type;
+
+  return $self;
+}
+
+sub xml { shift->_html(xml => @_) }
+
+sub _add {
+  my ($self, $offset, $new) = @_;
+
+  # Not a tag
+  return $self if (my $tree = $self->tree)->[0] eq 'root';
+
+  # Find parent
+  my $parent = $tree->[3];
+  my $i = $parent->[0] eq 'root' ? 1 : 4;
+  for my $e (@$parent[$i .. $#$parent]) {
+    last if $e == $tree;
+    $i++;
+  }
+
+  # Add children
+  splice @$parent, $i + $offset, 0, @{_parent($self->_parse("$new"), $parent)};
+
+  return $self;
+}
+
+sub _elements {
+  return [] unless my $e = shift;
+  return [@$e[($e->[0] eq 'root' ? 1 : 4) .. $#$e]];
+}
+
+sub _html {
+  my ($self, $method) = (shift, shift);
+  return $self->[0]->$method unless @_;
+  $self->[0]->$method(@_);
+  return $self;
+}
+
+sub _parent {
+  my ($children, $parent) = @_;
+
+  # Link parent to children
+  my @new;
+  for my $e (@$children[1 .. $#$children]) {
+    if ($e->[0] eq 'tag') {
+      $e->[3] = $parent;
+      weaken $e->[3];
     }
+    push @new, $e;
+  }
 
-    return $text;
+  return \@new;
 }
 
-sub to_xml {
-    my $self = shift;
-
-    # Render
-    my $result = $self->_render($self->tree);
-
-    # Encode
-    my $charset = $self->charset;
-    $result = b($result)->encode($charset)->to_string if $charset;
-
-    return $result;
+sub _parse {
+  my $self = shift;
+  Mojo::DOM::HTML->new(charset => $self->charset, xml => $self->xml)
+    ->parse(shift)->tree;
 }
 
-# Woah! God is so in your face!
-# Yeah, he's my favorite fictional character.
-sub _cdata {
-    my ($self, $cdata, $current) = @_;
-
-    # Append
-    push @$$current, ['cdata', $cdata];
-}
-
-sub _comment {
-    my ($self, $comment, $current) = @_;
-
-    # Append
-    push @$$current, ['comment', $comment];
-}
-
-sub _compare {
-    my ($self, $selector, $current) = @_;
-
-    # Selectors
-    for my $c (@$selector[1 .. $#$selector]) {
-        my $type = $c->[0];
-
-        # Tag
-        if ($type eq 'tag') {
-            my $name = $c->[1];
-
-            # Wildcard
-            next if $name eq '*';
-
-            # Name (ignore namespace prefix)
-            next if $current->[1] =~ /\:?$name$/;
-        }
-
-        # Attribute
-        elsif ($type eq 'attribute') {
-            my $key   = $c->[1];
-            my $regex = $c->[2];
-            my $attrs = $current->[2];
-
-            # Find attributes (ignore namespace prefix)
-            my $found = 0;
-            for my $name (keys %$attrs) {
-                if ($name =~ /\:?$key$/) {
-                    ++$found and last
-                      if !$regex || ($attrs->{$name} || '') =~ /$regex/;
-                }
-            }
-            next if $found;
-        }
-
-        # Pseudo class
-        elsif ($type eq 'pseudoclass') {
-            my $class = $c->[1];
-
-            # ":root"
-            if ($class eq 'root') {
-                if (my $parent = $current->[3]) {
-                    next if $parent->[0] eq 'root';
-                }
-            }
-        }
-
-        return;
-    }
-
-    return 1;
-}
-
-sub _css_unescape {
-    my ($self, $value) = @_;
-
-    # Remove escaped newlines
-    $value =~ s/\\\n//g;
-
-    # Unescape unicode characters
-    $value =~ s/\\([0-9a-fA-F]{1,6})\s?/pack('U', hex $1)/gex;
-
-    # Remove backslash
-    $value =~ s/\\//g;
-
-    return $value;
-}
-
-sub _doctype {
-    my ($self, $doctype, $current) = @_;
-
-    # Append
-    push @$$current, ['doctype', $doctype];
-}
-
-sub _end {
-    my ($self, $end, $current) = @_;
-
-    # Root
-    return if $$current->[0] eq 'root';
-
-    # Walk backwards
-    while (1) {
-
-        # Root
-        last if $$current->[0] eq 'root';
-
-        # Match
-        return $$current = $$current->[3] if $end eq $$current->[1];
-
-        # Children to move to parent
-        my @buffer = splice @$$current, 4;
-
-        # Parent
-        $$current = $$current->[3];
-
-        # Update parent reference
-        for my $e (@buffer) {
-            $e->[3] = $$current if $e->[0] eq 'tag';
-            weaken $e->[3];
-        }
-
-        # Move children
-        push @$$current, @buffer;
-    }
-}
-
-sub _match {
-    my ($self, $candidate, $pattern) = @_;
-
-    # Parts
-    my $first = 2;
-    for my $part (@$pattern) {
-
-        # Selectors
-        my @selectors = reverse @$part;
-
-        # Match
-        my ($current, $marker, $snapback);
-        my $parentonly = 0;
-        for (my $i = 0; $i <= $#selectors; $i++) {
-            my $selector = $selectors[$i];
-
-            # Combinator
-            $parentonly-- if $parentonly > 0;
-            if ($selector->[0] eq 'combinator') {
-
-                # Parent only ">"
-                if ($selector->[1] eq '>') {
-                    $parentonly += 2;
-                    $marker   = $i - 1   unless defined $marker;
-                    $snapback = $current unless $snapback;
-                }
-
-                # Move on
-                next;
-            }
-
-            while (1) {
-                $first-- if $first != 0;
-
-                # Next parent
-                return
-                  unless $current = $current ? $current->[3] : $candidate;
-
-                # Root
-                return if $current->[0] ne 'tag';
-
-                # Compare part to element
-                last if $self->_compare($selector, $current);
-
-                # First selector needs to match
-                return if $first;
-
-                # Parent only
-                if ($parentonly) {
-                    $i        = $marker - 1;
-                    $current  = $snapback;
-                    $snapback = undef;
-                    $marker   = undef;
-                    last;
-                }
-            }
-        }
-    }
-
-    return 1;
-}
-
-sub _parse_css {
-    my ($self, $css) = @_;
-
-    # Tokenize
-    my $pattern = [[]];
-    while ($css =~ /$CSS_TOKEN_RE/g) {
-        my $separator  = $1;
-        my $element    = $2;
-        my $pc         = $3;
-        my $attributes = $4;
-        my $combinator = $5;
-
-        # Trash
-        next
-          unless $separator || $element || $pc || $attributes || $combinator;
-
-        # New selector
-        push @$pattern, [] if $separator;
-
-        # Part
-        my $part = $pattern->[-1];
-
-        # Selector
-        push @$part, ['element'];
-        my $selector = $part->[-1];
-
-        # Element
-        $element ||= '';
-        my $tag = '*';
-        $element =~ s/$CSS_ELEMENT_RE// and $tag = $self->_css_unescape($1);
-
-        # Tag
-        push @$selector, ['tag', $tag];
-
-        # Classes
-        while ($element =~ /$CSS_CLASS_RE/g) {
-            my $class = $self->_css_unescape($1);
-            push @$selector,
-              ['attribute', 'class', qr/(?:^|.*\s+)$class(?:\s+.*|$)/];
-        }
-
-        # ID
-        if ($element =~ /$CSS_ID_RE/) {
-            my $id = $self->_css_unescape($1);
-            push @$selector, ['attribute', 'id', qr/^$id$/];
-        }
-
-        # Pseudo classes
-        while ($pc =~ /$CSS_PSEUDO_CLASS_RE/g) {
-            push @$selector, ['pseudoclass', $1, $2];
-        }
-
-        # Attributes
-        while ($attributes =~ /$CSS_ATTR_RE/g) {
-            my $key   = $self->_css_unescape($1);
-            my $op    = $2 || '';
-            my $value = $3;
-
-            # Regex
-            my $regex;
-
-            # Value
-            if ($value) {
-
-                # Quote
-                $value = quotemeta $self->_css_unescape($value);
-
-                # "^=" (begins with)
-                if ($op eq '^') { $regex = qr/^$value/ }
-
-                # "$=" (ends with)
-                elsif ($op eq '$') { $regex = qr/$value$/ }
-
-                # Everything else
-                else { $regex = qr/^$value$/ }
-            }
-
-            push @$selector, ['attribute', $key, $regex];
-        }
-
-        # Combinator
-        push @$part, ['combinator', $combinator] if $combinator;
-    }
-
-    return $pattern;
-}
-
-sub _parse_xml {
-    my ($self, $xml) = @_;
-
-    # State
-    my $tree    = ['root'];
-    my $current = $tree;
-
-    # Decode
-    my $charset = $self->charset;
-    $xml = b($xml)->decode($charset)->to_string if $charset;
-    return $tree unless $xml;
-
-    # Tokenize
-    while ($xml =~ /$XML_TOKEN_RE/g) {
-        my $text    = $1;
-        my $pi      = $2;
-        my $comment = $3;
-        my $cdata   = $4;
-        my $doctype = $5;
-        my $tag     = $6;
-
-        # Text
-        if ($text) {
-
-            # Unescape
-            $text = b($text)->html_unescape->to_string if $text =~ /&/;
-
-            $self->_text($text, \$current);
-        }
-
-        # DOCTYPE
-        if ($doctype) { $self->_doctype($doctype, \$current) }
-
-        # Comment
-        elsif ($comment) {
-            $self->_comment($comment, \$current);
-        }
-
-        # CDATA
-        elsif ($cdata) { $self->_cdata($cdata, \$current) }
-
-        # Processing instruction
-        elsif ($pi) { $self->_pi($pi, \$current) }
-
-        next unless $tag;
-
-        # End
-        if ($tag =~ /$XML_END_RE/) {
-            if (my $end = lc $1) { $self->_end($end, \$current) }
-        }
-
-        # Start
-        elsif ($tag =~ /$XML_START_RE/) {
-            my $start = lc $1;
-            my $attr  = $2;
-
-            # Attributes
-            my $attrs = {};
-            while ($attr =~ /$XML_ATTR_RE/g) {
-                my $key   = $1;
-                my $value = $2;
-                $value = $3 unless defined $value;
-                $value = $4 unless defined $value;
-
-                # End
-                next if $key eq '/';
-
-                # Unescape
-                $value = b($value)->html_unescape->to_string
-                  if $value && $value =~ /&/;
-
-                # Merge
-                $attrs->{$key} = $value;
-            }
-
-            # Start
-            $self->_start($start, $attrs, \$current);
-        }
-    }
-
-    return $tree;
-}
-
-sub _pi {
-    my ($self, $pi, $current) = @_;
-
-    # Append
-    push @$$current, ['pi', $pi];
-}
-
-sub _render {
-    my ($self, $tree) = @_;
-
-    # Element
-    my $e = $tree->[0];
-
-    # Text (escaped)
-    return b($tree->[1])->xml_escape->to_string if $e eq 'text';
-
-    # DOCTYPE
-    return "<!DOCTYPE" . $tree->[1] . ">" if $e eq 'doctype';
-
-    # Comment
-    return "<!--" . $tree->[1] . "-->" if $e eq 'comment';
-
-    # CDATA
-    return "<![CDATA[" . $tree->[1] . "]]>" if $e eq 'cdata';
-
-    # Processing instruction
-    return "<?" . $tree->[1] . "?>" if $e eq 'pi';
-
-    # Offset
-    my $start = $e eq 'root' ? 1 : 2;
-
-    # Content
-    my $content = '';
-
-    # Start tag
-    if ($e eq 'tag') {
-
-        # Offset
-        $start = 4;
-
-        # Open tag
-        $content .= '<' . $tree->[1];
-
-        # Attributes
-        my @attrs;
-        for my $key (sort keys %{$tree->[2]}) {
-            my $value = $tree->[2]->{$key};
-
-            # No value
-            push @attrs, $key and next unless $value;
-
-            # Escape
-            $value = b($value)->xml_escape->to_string;
-
-            # Key and value
-            push @attrs, qq/$key="$value"/;
-        }
-        my $attrs = join ' ', @attrs;
-        $content .= " $attrs" if $attrs;
-
-        # Empty tag
-        return "$content />" unless $tree->[4];
-
-        # Close tag
-        $content .= '>';
-    }
-
-    # Walk tree
-    for my $i ($start .. $#$tree) {
-
-        # Render next element
-        $content .= $self->_render($tree->[$i]);
-    }
-
-    # End tag
-    $content .= '</' . $tree->[1] . '>' if $e eq 'tag';
-
-    return $content;
-}
-
-sub _select {
-    my ($self, $tree, $pattern) = @_;
-
-    # Walk tree
-    my @results;
-    my @queue = ($tree);
-    while (my $current = shift @queue) {
-
-        # Type
-        my $type = $current->[0];
-
-        # Root
-        if ($type eq 'root') {
-
-            # Fill queue
-            unshift @queue, @$current[1 .. $#$current];
-            next;
-        }
-
-        # Tag
-        elsif ($type eq 'tag') {
-
-            # Fill queue
-            unshift @queue, @$current[4 .. $#$current];
-
-            # Match
-            push @results, $current if $self->_match($current, $pattern);
-        }
-    }
-
-    # Upgrade results
-    @results =
-      map { $self->new(charset => $self->charset, tree => $_) } @results;
-
-    # Collection
-    return bless \@results, 'Mojo::DOM::_Collection';
-}
-
-# It's not important to talk about who got rich off of whom,
-# or who got exposed to tainted what...
-sub _start {
-    my ($self, $start, $attrs, $current) = @_;
-
-    # New
-    my $new = ['tag', $start, $attrs, $$current];
-    weaken $new->[3];
-
-    # Append
-    push @$$current, $new;
-    $$current = $new;
+sub _sibling {
+  my ($self, $next) = @_;
+
+  # Make sure we have a parent
+  return undef unless my $parent = $self->parent;
+
+  # Find previous or next sibling
+  my ($previous, $current);
+  for my $child ($parent->children->each) {
+    ++$current and next if $child->tree eq $self->tree;
+    return $next ? $child : $previous if $current;
+    $previous = $child;
+  }
+
+  # No siblings
+  return undef;
 }
 
 sub _text {
-    my ($self, $text, $current) = @_;
+  my ($elements, $recurse, $trim) = @_;
 
-    # Append
-    push @$$current, ['text', $text];
+  # Walk tree
+  my $text = '';
+  for my $e (@$elements) {
+    my $type = $e->[0];
+
+    # Nested tag
+    my $content = '';
+    if ($type eq 'tag' && $recurse) {
+      $content = _text(_elements($e), 1, _trim($e, $trim));
+    }
+
+    # Text
+    elsif ($type eq 'text') { $content = $trim ? squish($e->[1]) : $e->[1] }
+
+    # CDATA or raw text
+    elsif ($type eq 'cdata' || $type eq 'raw') { $content = $e->[1] }
+
+    # Add leading whitespace if punctuation allows it
+    $content = " $content" if $text =~ /\S\z/ && $content =~ /^[^.!?,;:\s]+/;
+
+    # Trim whitespace blocks
+    $text .= $content if $content =~ /\S+/ || !$trim;
+  }
+
+  return $text;
 }
 
-package Mojo::DOM::_Collection;
+sub _trim {
+  my ($e, $trim) = @_;
 
-sub each  { shift->_iterate(@_) }
-sub until { shift->_iterate(@_, 1) }
-sub while { shift->_iterate(@_, 0) }
+  # Disabled
+  return 0 unless $e && ($trim = defined $trim ? $trim : 1);
 
-sub _iterate {
-    my ($self, $cb, $cond) = @_;
+  # Detect "pre" tag
+  while ($e->[0] eq 'tag') {
+    return 0 if $e->[1] eq 'pre';
+    last unless $e = $e->[3];
+  }
 
-    # Shortcut
-    return @$self unless $cb;
-
-    # Iterator
-    my $i = 1;
-
-    # Iterate until condition is true
-    if (defined $cond) { !!$_->$cb($i++) == $cond && last for @$self }
-
-    # Iterate over all elements
-    else { $_->$cb($i++) for @$self }
-
-    # Root
-    return unless my $start = $self->[0];
-    return $start->root;
+  return 1;
 }
 
 1;
-__END__
 
 =head1 NAME
 
-Mojo::DOM - Minimalistic XML DOM Parser With CSS3 Selectors
+Mojo::DOM - Minimalistic HTML/XML DOM parser with CSS selectors
 
 =head1 SYNOPSIS
 
-    use Mojo::DOM;
+  use Mojo::DOM;
 
-    # Parse
-    my $dom = Mojo::DOM->new;
-    $dom->parse('<div><div id="a">A</div><div id="b">B</div></div>');
+  # Parse
+  my $dom = Mojo::DOM->new('<div><p id="a">A</p><p id="b">B</p></div>');
 
-    # Find
-    my $b = $dom->at('#b');
-    print $b->text;
+  # Find
+  say $dom->at('#b')->text;
+  say $dom->find('p')->pluck('text');
 
-    # Iterate
-    $dom->find('div[id]')->each(sub { print shift->text });
+  # Walk
+  say $dom->div->p->[0]->text;
+  say $dom->div->children('p')->first->{id};
 
-    # Get the first 10 links
-    $dom->find('a[href]')
-      ->while(sub { print shift->attrs->{href} && pop() < 10 });
+  # Iterate
+  $dom->find('p[id]')->each(sub { say shift->{id} });
 
-    # Search for a link about a specific topic
-    $dom->find('a[href]')
-      ->until(sub { $_->text =~ m/kraih/ && print $_->attrs->{href} });
+  # Loop
+  for my $e ($dom->find('p[id]')->each) {
+    say $e->text;
+  }
+
+  # Modify
+  $dom->div->p->[1]->append('<p id="c">C</p>');
+
+  # Render
+  say $dom;
 
 =head1 DESCRIPTION
 
-L<Mojo::DOM> is a minimalistic and very relaxed XML DOM parser with support
-for CSS3 selectors.
-Note that this module is EXPERIMENTAL and might change without warning!
+L<Mojo::DOM> is a minimalistic and relaxed HTML/XML DOM parser with CSS
+selector support. It will even try to interpret broken XML, so you should not
+use it for validation.
 
-=head2 SELECTORS
+=head1 CASE SENSITIVITY
 
-These CSS3 selectors are currently implemented.
+L<Mojo::DOM> defaults to HTML semantics, that means all tags and attributes
+are lowercased and selectors need to be lower case as well.
 
-=over 4
+  my $dom = Mojo::DOM->new('<P ID="greeting">Hi!</P>');
+  say $dom->at('p')->text;
+  say $dom->p->{id};
 
-=item C<*>
+If XML processing instructions are found, the parser will automatically switch
+into XML mode and everything becomes case sensitive.
 
-Any element.
+  my $dom = Mojo::DOM->new('<?xml version="1.0"?><P ID="greeting">Hi!</P>');
+  say $dom->at('P')->text;
+  say $dom->P->{ID};
 
-=item C<E>
+XML detection can also be disabled with the C<xml> method.
 
-    my $title = $dom->at('title');
+  # Force XML semantics
+  $dom->xml(1);
 
-An element of type C<E>.
-
-=item C<E[foo]>
-
-    my $links = $dom->find('a[href]');
-
-An C<E> element with a C<foo> attribute.
-
-=item C<E[foo="bar"]>
-
-    my $fields = $dom->find('input[name="foo"]');
-
-An C<E> element whose C<foo> attribute value is exactly equal to C<bar>.
-
-=item C<E[foo^="bar"]>
-
-    my $fields = $dom->find('input[name^="f"]');
-
-An C<E> element whose C<foo> attribute value begins exactly with the string
-C<bar>.
-
-=item C<E[foo$="bar"]>
-
-    my $fields = $dom->find('input[name$="o"]');
-
-An C<E> element whose C<foo> attribute value ends exactly with the string
-C<bar>.
-
-=item C<E:root>
-
-    my $root = $dom->at(':root');
-
-An C<E> element, root of the document.
-
-=item C<E F>
-
-    my $headlines = $dom->find('div h1');
-
-An C<F> element descendant of an C<E> element.
-
-=item C<E E<gt> F>
-
-    my $headlines = $dom->find('html > body > div > h1');
-
-An C<F> element child of an C<E> element.
-
-=back
-
-=head1 ATTRIBUTES
-
-L<Mojo::DOM> implements the following attributes.
-
-=head2 C<charset>
-
-    my $charset = $dom->charset;
-    $dom        = $dom->charset('UTF-8');
-
-Charset used for decoding XML.
-
-=head2 C<tree>
-
-    my $array = $dom->tree;
-    $dom      = $dom->tree(['root', ['text', 'lalala']]);
-
-Document Object Model.
+  # Force HTML semantics
+  $dom->xml(0);
 
 =head1 METHODS
 
 L<Mojo::DOM> inherits all methods from L<Mojo::Base> and implements the
 following new ones.
 
-=head2 C<all_text>
+=head2 new
 
-    my $text = $dom->all_text;
+  my $dom = Mojo::DOM->new;
+  my $dom = Mojo::DOM->new('<foo bar="baz">test</foo>');
 
-Extract all text content from DOM structure.
+Construct a new array-based L<Mojo::DOM> object.
 
-=head2 C<at>
+=head2 all_text
 
-    my $result = $dom->at('html title');
+  my $trimmed   = $dom->all_text;
+  my $untrimmed = $dom->all_text(0);
 
-Find a single element with CSS3 selectors.
+Extract all text content from DOM structure, smart whitespace trimming is
+enabled by default.
 
-=head2 C<attrs>
+  # "foo bar baz"
+  $dom->parse("<div>foo\n<p>bar</p>baz\n</div>")->div->all_text;
 
-    my $attrs = $dom->attrs;
+  # "foo\nbarbaz\n"
+  $dom->parse("<div>foo\n<p>bar</p>baz\n</div>")->div->all_text(0);
+
+=head2 append
+
+  $dom = $dom->append('<p>Hi!</p>');
+
+Append to element.
+
+  # "<div><h1>A</h1><h2>B</h2></div>"
+  $dom->parse('<div><h1>A</h1></div>')->at('h1')->append('<h2>B</h2>')->root;
+
+=head2 append_content
+
+  $dom = $dom->append_content('<p>Hi!</p>');
+
+Append to element content.
+
+  # "<div><h1>AB</h1></div>"
+  $dom->parse('<div><h1>A</h1></div>')->at('h1')->append_content('B')->root;
+
+=head2 at
+
+  my $result = $dom->at('html title');
+
+Find a single element with CSS selectors. All selectors from L<Mojo::DOM::CSS>
+are supported.
+
+  # Find first element with "svg" namespace definition
+  my $namespace = $dom->at('[xmlns\:svg]')->{'xmlns:svg'};
+
+=head2 attrs
+
+  my $attrs = $dom->attrs;
+  my $foo   = $dom->attrs('foo');
+  $dom      = $dom->attrs({foo => 'bar'});
+  $dom      = $dom->attrs(foo => 'bar');
 
 Element attributes.
 
-=head2 C<children>
+=head2 charset
 
-    my $children = $dom->children;
+  my $charset = $dom->charset;
+  $dom        = $dom->charset('UTF-8');
 
-Children of element.
+Charset used for decoding and encoding HTML/XML.
 
-=head2 C<find>
+=head2 children
 
-    my $results = $dom->find('html title');
+  my $collection = $dom->children;
+  my $collection = $dom->children('div');
 
-Find elements with CSS3 selectors.
+Return a L<Mojo::Collection> object containing the children of this element,
+similar to C<find>.
 
-    $dom->find('div')->each(sub { print shift->text });
-    $dom->find('div')->while(sub { print $_->text && $_->text =~ /foo/ });
-    $dom->find('div')->until(sub { $_->text =~ /foo/ && print $_->text });
+  # Show type of random child element
+  say $dom->children->shuffle->first->type;
 
-=head2 C<name>
+=head2 content_xml
 
-    my $name = $dom->name;
-    $dom     = $dom->name('html');
+  my $xml = $dom->content_xml;
 
-Element name.
+Render content of this element to XML. Note that the XML will be encoded if a
+C<charset> has been defined.
 
-=head2 C<namespace>
+  # "<b>test</b>"
+  $dom->parse('<div><b>test</b></div>')->div->content_xml;
 
-    my $namespace = $dom->namespace;
+=head2 find
 
-Element namespace.
+  my $collection = $dom->find('html title');
 
-=head2 C<parent>
+Find elements with CSS selectors and return a L<Mojo::Collection> object. All
+selectors from L<Mojo::DOM::CSS> are supported.
 
-    my $parent = $dom->parent;
+  # Find a specific element and extract information
+  my $id = $dom->find('div')->[23]{id};
+
+  # Extract information from multiple elements
+  my @headers = $dom->find('h1, h2, h3')->pluck('text')->each;
+
+=head2 namespace
+
+  my $namespace = $dom->namespace;
+
+Find element namespace.
+
+  # Find namespace for an element with namespace prefix
+  my $namespace = $dom->at('svg > svg\:circle')->namespace;
+
+  # Find namespace for an element that may or may not have a namespace prefix
+  my $namespace = $dom->at('svg > circle')->namespace;
+
+=head2 next
+
+  my $sibling = $dom->next;
+
+Next sibling of element.
+
+  # "<h2>B</h2>"
+  $dom->parse('<div><h1>A</h1><h2>B</h2></div>')->at('h1')->next;
+
+=head2 parent
+
+  my $parent = $dom->parent;
 
 Parent of element.
 
-=head2 C<parse>
+=head2 parse
 
-    $dom = $dom->parse('<foo bar="baz">test</foo>');
+  $dom = $dom->parse('<foo bar="baz">test</foo>');
 
-Parse XML document.
+Parse HTML/XML document with L<Mojo::DOM::HTML>.
 
-=head2 C<replace>
+  # Parse UTF-8 encoded XML
+  my $dom = Mojo::DOM->new->charset('UTF-8')->xml(1)->parse($xml);
 
-    $dom = $dom->replace('<div>test</div>');
+=head2 prepend
 
-Replace elements.
+  $dom = $dom->prepend('<p>Hi!</p>');
 
-=head2 C<replace_content>
+Prepend to element.
 
-    $dom = $dom->replace_content('test');
+  # "<div><h1>A</h1><h2>B</h2></div>"
+  $dom->parse('<div><h2>B</h2></div>')->at('h2')->prepend('<h1>A</h1>')->root;
+
+=head2 prepend_content
+
+  $dom = $dom->prepend_content('<p>Hi!</p>');
+
+Prepend to element content.
+
+  # "<div><h2>AB</h2></div>"
+  $dom->parse('<div><h2>B</h2></div>')->at('h2')->prepend_content('A')->root;
+
+=head2 previous
+
+  my $sibling = $dom->previous;
+
+Previous sibling of element.
+
+  # "<h1>A</h1>"
+  $dom->parse('<div><h1>A</h1><h2>B</h2></div>')->at('h2')->previous;
+
+=head2 remove
+
+  my $old = $dom->remove;
+
+Remove element.
+
+  # "<div></div>"
+  $dom->parse('<div><h1>A</h1></div>')->at('h1')->remove->root;
+
+=head2 replace
+
+  my $old = $dom->replace('<div>test</div>');
+
+Replace element.
+
+  # "<div><h2>B</h2></div>"
+  $dom->parse('<div><h1>A</h1></div>')->at('h1')->replace('<h2>B</h2>')->root;
+
+  # "<div></div>"
+  $dom->parse('<div><h1>A</h1></div>')->at('h1')->replace('')->root;
+
+=head2 replace_content
+
+  $dom = $dom->replace_content('test');
 
 Replace element content.
 
-=head2 C<root>
+  # "<div><h1>B</h1></div>"
+  $dom->parse('<div><h1>A</h1></div>')->at('h1')->replace_content('B')->root;
 
-    my $root = $dom->root;
+  # "<div><h1></h1></div>"
+  $dom->parse('<div><h1>A</h1></div>')->at('h1')->replace_content('')->root;
 
-Find root element.
+=head2 root
 
-=head2 C<text>
+  my $root = $dom->root;
 
-    my $text = $dom->text;
+Find root node.
 
-Extract text content from element only, not including child elements.
+=head2 text
 
-=head2 C<to_xml>
+  my $trimmed   = $dom->text;
+  my $untrimmed = $dom->text(0);
 
-    my $xml = $dom->to_xml;
+Extract text content from element only (not including child elements), smart
+whitespace trimming is enabled by default.
 
-Render DOM to XML.
+  # "foo baz"
+  $dom->parse("<div>foo\n<p>bar</p>baz\n</div>")->div->text;
+
+  # "foo\nbaz\n"
+  $dom->parse("<div>foo\n<p>bar</p>baz\n</div>")->div->text(0);
+
+=head2 text_after
+
+  my $trimmed   = $dom->text_after;
+  my $untrimmed = $dom->text_after(0);
+
+Extract text content immediately following element, smart whitespace trimming
+is enabled by default.
+
+  # "baz"
+  $dom->parse("<div>foo\n<p>bar</p>baz\n</div>")->div->p->text_after;
+
+  # "baz\n"
+  $dom->parse("<div>foo\n<p>bar</p>baz\n</div>")->div->p->text_after(0);
+
+=head2 text_before
+
+  my $trimmed   = $dom->text_before;
+  my $untrimmed = $dom->text_before(0);
+
+Extract text content immediately preceding element, smart whitespace trimming
+is enabled by default.
+
+  # "foo"
+  $dom->parse("<div>foo\n<p>bar</p>baz\n</div>")->div->p->text_before;
+
+  # "foo\n"
+  $dom->parse("<div>foo\n<p>bar</p>baz\n</div>")->div->p->text_before(0);
+
+=head2 to_xml
+
+  my $xml = $dom->to_xml;
+  my $xml = "$dom";
+
+Render this element and its content to XML. Note that the XML will be encoded
+if a C<charset> has been defined.
+
+  # "<b>test</b>"
+  $dom->parse('<div><b>test</b></div>')->div->b->to_xml;
+
+=head2 tree
+
+  my $tree = $dom->tree;
+  $dom     = $dom->tree(['root', [qw(text lalala)]]);
+
+Document Object Model.
+
+=head2 type
+
+  my $type = $dom->type;
+  $dom     = $dom->type('div');
+
+Element type.
+
+  # List types of child elements
+  say $dom->children->pluck('type');
+
+=head2 xml
+
+  my $xml = $dom->xml;
+  $dom    = $dom->xml(1);
+
+Disable HTML semantics in parser and activate case sensitivity, defaults to
+auto detection based on processing instructions.
+
+=head1 CHILD ELEMENTS
+
+In addition to the methods above, many child elements are also automatically
+available as object methods, which return a L<Mojo::DOM> or
+L<Mojo::Collection> object, depending on number of children.
+
+  say $dom->p->text;
+  say $dom->div->[23]->text;
+  say $dom->div->pluck('text');
+
+=head1 ELEMENT ATTRIBUTES
+
+Direct hash reference access to element attributes is also possible.
+
+  say $dom->{foo};
+  say $dom->div->{id};
 
 =head1 SEE ALSO
 
-L<Mojolicious>, L<Mojolicious::Guides>, L<http://mojolicious.org>.
+L<Mojolicious>, L<Mojolicious::Guides>, L<http://mojolicio.us>.
 
 =cut

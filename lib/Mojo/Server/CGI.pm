@@ -1,160 +1,136 @@
 package Mojo::Server::CGI;
+use Mojo::Base 'Mojo::Server';
 
-use strict;
-use warnings;
+has 'nph';
 
-use base 'Mojo::Server';
-
-use constant CHUNK_SIZE => $ENV{MOJO_CHUNK_SIZE} || 262144;
-
-__PACKAGE__->attr(nph => 0);
-
-# Lisa, you're a Buddhist, so you believe in reincarnation.
-# Eventually, Snowball will be reborn as a higher lifeform... like a snowman.
 sub run {
-    my $self = shift;
+  my $self = shift;
 
-    my $tx  = $self->build_tx_cb->($self);
-    my $req = $tx->req;
+  # Environment
+  my $tx  = $self->build_tx;
+  my $req = $tx->req->parse(\%ENV);
 
-    # Environment
-    $req->parse(\%ENV);
+  # Store connection information
+  $tx->local_port($ENV{SERVER_PORT})->remote_address($ENV{REMOTE_ADDR});
 
-    # Store connection information
-    $tx->remote_address($ENV{REMOTE_ADDR});
-    $tx->local_port($ENV{SERVER_PORT});
+  # Request body
+  binmode STDIN;
+  until ($req->is_finished) {
+    last unless my $read = STDIN->read(my $buffer, 131072, 0);
+    $req->parse($buffer);
+  }
 
-    # Request body
-    while (!$req->is_done) {
-        my $read = STDIN->sysread(my $buffer, CHUNK_SIZE, 0);
-        last unless $read;
-        $req->parse($buffer);
-    }
+  # Handle
+  $self->emit(request => $tx);
 
-    # Handle
-    $self->handler_cb->($self, $tx);
+  # Response start line
+  STDOUT->autoflush(1);
+  binmode STDOUT;
+  my $res = $tx->res;
+  return undef if $self->nph && !_write($res, 'get_start_line_chunk');
 
-    my $res = $tx->res;
+  # Response headers
+  $res->fix_headers;
+  my $code = $res->code    || 404;
+  my $msg  = $res->message || $res->default_message;
+  $res->headers->status("$code $msg") unless $self->nph;
+  return undef unless _write($res, 'get_header_chunk');
 
-    # Response start line
-    my $offset = 0;
-    if ($self->nph) {
-        while (1) {
-            my $chunk = $res->get_start_line_chunk($offset);
+  # Response body
+  return undef unless _write($res, 'get_body_chunk');
 
-            # No start line yet, try again
-            unless (defined $chunk) {
-                sleep 1;
-                next;
-            }
+  # Finish transaction
+  $tx->server_close;
 
-            # End of start line
-            last unless length $chunk;
+  return $res->code;
+}
 
-            # Start line
-            return unless STDOUT->opened;
-            my $written = STDOUT->syswrite($chunk);
-            return unless defined $written;
-            $offset += $written;
-        }
-    }
+sub _write {
+  my ($res, $method) = @_;
 
-    # Status
-    if (my $code = $res->code) {
-        my $message = $res->message || $res->default_message;
-        $res->headers->header(Status => "$code $message") unless $self->nph;
-    }
+  # Write chunks to STDOUT
+  my $offset = 0;
+  while (1) {
 
-    # Response headers
-    $offset = 0;
-    while (1) {
-        my $chunk = $res->get_header_chunk($offset);
+    # No chunk yet, try again
+    sleep 1 and next unless defined(my $chunk = $res->$method($offset));
 
-        # No headers yet, try again
-        unless (defined $chunk) {
-            sleep 1;
-            next;
-        }
+    # End of part
+    last unless my $len = length $chunk;
 
-        # End of headers
-        last unless length $chunk;
+    # Part
+    $offset += $len;
+    return undef unless STDOUT->opened;
+    print STDOUT $chunk;
+  }
 
-        # Headers
-        return unless STDOUT->opened;
-        my $written = STDOUT->syswrite($chunk);
-        return unless defined $written;
-        $offset += $written;
-    }
-
-    # Response body
-    $offset = 0;
-    while (1) {
-        my $chunk = $res->get_body_chunk($offset);
-
-        # No content yet, try again
-        unless (defined $chunk) {
-            sleep 1;
-            next;
-        }
-
-        # End of content
-        last unless length $chunk;
-
-        # Content
-        return unless STDOUT->opened;
-        my $written = STDOUT->syswrite($chunk);
-        return unless defined $written;
-        $offset += $written;
-    }
-
-    # Finish transaction
-    $tx->finished->($tx);
-
-    return $res->code;
+  return 1;
 }
 
 1;
-__END__
 
 =head1 NAME
 
-Mojo::Server::CGI - CGI Server
+Mojo::Server::CGI - CGI server
 
 =head1 SYNOPSIS
 
-    use Mojo::Server::CGI;
-    my $cgi = Mojo::Server::CGI->new;
-    $cgi->run;
+  use Mojo::Server::CGI;
+
+  my $cgi = Mojo::Server::CGI->new;
+  $cgi->unsubscribe('request')
+  $cgi->on(request => sub {
+    my ($cgi, $tx) = @_;
+
+    # Request
+    my $method = $tx->req->method;
+    my $path   = $tx->req->url->path;
+
+    # Response
+    $tx->res->code(200);
+    $tx->res->headers->content_type('text/plain');
+    $tx->res->body("$method request for $path!");
+
+    # Resume transaction
+    $tx->resume;
+  });
+  $cgi->run;
 
 =head1 DESCRIPTION
 
 L<Mojo::Server::CGI> is a simple and portable implementation of RFC 3875.
+
+See L<Mojolicious::Guides::Cookbook> for more.
+
+=head1 EVENTS
+
+L<Mojo::Server::CGI> inherits all events from L<Mojo::Server>.
 
 =head1 ATTRIBUTES
 
 L<Mojo::Server::CGI> inherits all attributes from L<Mojo::Server> and
 implements the following new ones.
 
-=head2 C<nph>
+=head2 nph
 
-    my $nph = $cgi->nph;
-    $cgi    = $cgi->nph(1);
+  my $nph = $cgi->nph;
+  $cgi    = $cgi->nph(1);
 
 Activate non parsed header mode.
 
 =head1 METHODS
 
-L<Mojo::Server::CGI> inherits all methods from L<Mojo::Server> and
-implements the following new ones.
+L<Mojo::Server::CGI> inherits all methods from L<Mojo::Server> and implements
+the following new ones.
 
-=head2 C<run>
+=head2 run
 
-    $cgi->run;
+  my $status = $cgi->run;
 
-Process CGI.
+Run CGI.
 
 =head1 SEE ALSO
 
-L<Mojolicious>, L<Mojolicious::Guides>, L<http://mojolicious.org>.
+L<Mojolicious>, L<Mojolicious::Guides>, L<http://mojolicio.us>.
 
 =cut
